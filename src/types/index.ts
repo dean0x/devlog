@@ -1,5 +1,5 @@
 /**
- * Core type definitions for the Second Memory system
+ * Core type definitions for the Devlog system
  *
  * ARCHITECTURE: All types use Result pattern for error handling
  * Pattern: Operations return Result<T, E> instead of throwing

@@ -1,5 +1,5 @@
 /**
- * Second Memory - Claude Code Memory System
+ * Devlog - Claude Code Memory System
  *
  * Main exports for programmatic usage
  */

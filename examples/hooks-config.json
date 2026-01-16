@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/second-memory/dist/hooks/post-tool-use.sh",
+            "command": "/path/to/devlog/dist/hooks/post-tool-use.sh",
             "timeout": 5000
           }
         ]
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/second-memory/dist/hooks/session-end.sh",
+            "command": "/path/to/devlog/dist/hooks/session-end.sh",
             "timeout": 10000
           }
         ]
