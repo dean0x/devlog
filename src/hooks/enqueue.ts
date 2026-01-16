@@ -5,6 +5,8 @@
  * Called by hook shell scripts to add events to the queue.
  * Reads event data from stdin (JSON) and writes to queue.
  *
+ * Auto-initializes .memory directory if it doesn't exist.
+ *
  * Usage:
  *   echo '{"event_type":"tool_use",...}' | node enqueue.js
  *
@@ -13,8 +15,10 @@
  */
 
 import { enqueueEvent, initQueue } from '../storage/queue.js';
+import { initMemoryStore } from '../storage/memory-store.js';
 import type { EventType } from '../types/index.js';
 import { join } from 'node:path';
+import { promises as fs } from 'node:fs';
 
 interface HookInput {
   readonly session_id?: string;
@@ -36,11 +40,57 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
+async function autoInit(baseDir: string): Promise<void> {
+  const memoryPath = join(baseDir, '.memory');
+
+  // Check if .memory already exists
+  try {
+    await fs.access(memoryPath);
+    return; // Already initialized
+  } catch {
+    // Directory doesn't exist, initialize it
+  }
+
+  // Initialize queue directories
+  const queueResult = await initQueue({ baseDir: join(memoryPath, 'queue') });
+  if (!queueResult.ok) {
+    throw new Error(`Failed to initialize queue: ${queueResult.error.message}`);
+  }
+
+  // Initialize memory store directories
+  const storeResult = await initMemoryStore({ baseDir: memoryPath });
+  if (!storeResult.ok) {
+    throw new Error(`Failed to initialize memory store: ${storeResult.error.message}`);
+  }
+
+  // Create initial memory files
+  const today = new Date().toISOString().split('T')[0];
+  const shortDir = join(memoryPath, 'short');
+
+  for (const file of ['today.md', 'this-week.md', 'this-month.md']) {
+    const path = join(shortDir, file);
+    try {
+      await fs.access(path);
+    } catch {
+      await fs.writeFile(path, `---
+date: ${today}
+entries: 0
+last_updated: ${new Date().toISOString()}
+---
+# ${file.replace('.md', '').replace(/-/g, ' ')} - ${today}
+`);
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const memoryDir = process.env['MEMORY_DIR'] ?? process.cwd();
   const queueDir = join(memoryDir, '.memory', 'queue');
 
-  // Initialize queue
+  // Auto-initialize if .memory doesn't exist
+  await autoInit(memoryDir);
+
+  // Ensure queue is initialized (idempotent)
   const initResult = await initQueue({ baseDir: queueDir });
   if (!initResult.ok) {
     console.error(`Failed to initialize queue: ${initResult.error.message}`);
