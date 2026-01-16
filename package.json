@@ -1,0 +1,42 @@
+{
+  "name": "devlog",
+  "version": "0.1.0",
+  "description": "Background memory extraction system for Claude Code",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "devlog": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "proxy": "node dist/proxy/server.js",
+    "daemon": "node dist/daemon/memoryd.js",
+    "dev:proxy": "tsx watch src/proxy/server.ts",
+    "dev:daemon": "tsx watch src/daemon/memoryd.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "chokidar": "^3.6.0",
+    "uuid": "^10.0.0",
+    "yaml": "^2.5.0",
+    "date-fns": "^3.6.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0",
+    "eslint": "^9.9.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

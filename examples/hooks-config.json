@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/schemas/hooks.json",
+  "_comment": "Copy the 'hooks' section to your ~/.claude/settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/second-memory/dist/hooks/post-tool-use.sh",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/second-memory/dist/hooks/session-end.sh",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
