@@ -190,6 +190,31 @@ Memories are automatically compacted over time:
 | `BATCH_SIZE` | 5 | Events to process per batch |
 | `POLL_INTERVAL` | 5000 | Queue poll interval (ms) |
 
+### Docker Configuration
+
+When running inside a Docker container (e.g., Claude Code in Docker), `localhost` refers to the container, not your host machine where Ollama runs.
+
+**Docker Desktop (Mac/Windows):**
+```bash
+export OLLAMA_BASE_URL=http://host.docker.internal:11434
+devlog proxy
+```
+
+**Linux Docker:**
+```bash
+# Option 1: Add host mapping when starting container
+docker run --add-host=host.docker.internal:host-gateway ...
+
+# Option 2: Use host's actual IP
+export OLLAMA_BASE_URL=http://192.168.1.x:11434
+```
+
+**Ollama also in Docker:**
+```bash
+# Use Docker networking (same network)
+export OLLAMA_BASE_URL=http://ollama:11434
+```
+
 ## Verification
 
 ### Test the Proxy
