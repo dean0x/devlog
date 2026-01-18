@@ -192,6 +192,7 @@ export interface MemoryEntry {
   readonly files?: readonly string[];
   readonly tags?: readonly string[];
   readonly related_events?: readonly string[];
+  readonly source?: MemoSource;
 }
 
 export interface ShortTermMemoryFile {
@@ -269,6 +270,13 @@ export interface GlobalConfig {
 // ============================================================================
 
 /**
+ * Source of extracted memo
+ * - 'claude': Extracted using Claude via proxy (higher confidence)
+ * - 'fallback': Extracted using heuristics when Claude unavailable (lower confidence)
+ */
+export type MemoSource = 'claude' | 'fallback';
+
+/**
  * Memo extraction result - null means skip (trivial interaction)
  */
 export interface ExtractedMemo {
@@ -277,6 +285,7 @@ export interface ExtractedMemo {
   readonly content: string;
   readonly files: readonly string[];
   readonly tags?: readonly string[];
+  readonly source?: MemoSource;
 }
 
 export interface ExtractionResult {

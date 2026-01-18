@@ -19,6 +19,61 @@
  */
 
 import { promises as fs } from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+
+// ============================================================================
+// Debug Logger
+// ============================================================================
+
+type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+
+interface Logger {
+  debug: (msg: string, data?: Record<string, unknown>) => void;
+  info: (msg: string, data?: Record<string, unknown>) => void;
+  warn: (msg: string, data?: Record<string, unknown>) => void;
+  error: (msg: string, data?: Record<string, unknown>) => void;
+  isDebug: () => boolean;
+}
+
+function createLogger(): Logger {
+  const isDebugMode = process.env['DEVLOG_DEBUG'] === '1';
+
+  function formatTime(): string {
+    const now = new Date();
+    return now.toTimeString().slice(0, 8);
+  }
+
+  function formatData(data?: Record<string, unknown>): string {
+    if (!data) return '';
+    const pairs = Object.entries(data).map(([k, v]) => {
+      if (typeof v === 'string' && v.length > 80) {
+        return `${k}="${v.slice(0, 77)}..."`;
+      }
+      return `${k}=${JSON.stringify(v)}`;
+    });
+    return pairs.length > 0 ? ` (${pairs.join(', ')})` : '';
+  }
+
+  function log(level: LogLevel, msg: string, data?: Record<string, unknown>): void {
+    // DEBUG only shows in debug mode
+    if (level === 'DEBUG' && !isDebugMode) return;
+
+    const timestamp = formatTime();
+    const dataStr = formatData(data);
+    console.log(`[${timestamp}] [${level}] ${msg}${dataStr}`);
+  }
+
+  return {
+    debug: (msg, data) => log('DEBUG', msg, data),
+    info: (msg, data) => log('INFO', msg, data),
+    warn: (msg, data) => log('WARN', msg, data),
+    error: (msg, data) => log('ERROR', msg, data),
+    isDebug: () => isDebugMode,
+  };
+}
+
+const logger = createLogger();
 import { watchQueue, completeBatch, failBatch, type WatcherConfig } from './watcher.js';
 import { extractMemoWithContext, memoToMemoryEntry, type ExtractorConfig } from './extractor.js';
 import { runDecay } from './decay.js';
@@ -40,6 +95,14 @@ import {
   readGlobalConfig,
 } from '../paths.js';
 import type { DaemonConfig, DaemonStatus, QueuedEvent, ProjectStats } from '../types/index.js';
+
+// ============================================================================
+// PID File Management
+// ============================================================================
+
+function getPidFilePath(): string {
+  return path.join(os.homedir(), '.devlog', 'daemon.pid');
+}
 
 // ============================================================================
 // Configuration
@@ -152,7 +215,7 @@ function shouldRunDecay(config: DaemonConfig): boolean {
 }
 
 async function runScheduledDecayForAllProjects(_config: DaemonConfig): Promise<void> {
-  console.log('Running scheduled decay for all projects...');
+  logger.info('Running scheduled decay for all projects...');
 
   // Run decay for each known project
   for (const projectPath of state.projects.keys()) {
@@ -160,13 +223,14 @@ async function runScheduledDecayForAllProjects(_config: DaemonConfig): Promise<v
 
     const result = await runDecay(memoryDir);
     if (result.ok) {
-      console.log(
-        `  ${projectPath}: daily(moved=${result.value.daily.moved}, filtered=${result.value.daily.filtered}), ` +
-        `weekly(moved=${result.value.weekly.moved}, filtered=${result.value.weekly.filtered}), ` +
-        `monthly(archived=${result.value.monthly.archived})`
-      );
+      logger.info(`Decay completed for ${projectPath}`, {
+        daily_moved: result.value.daily.moved,
+        daily_filtered: result.value.daily.filtered,
+        weekly_moved: result.value.weekly.moved,
+        monthly_archived: result.value.monthly.archived,
+      });
     } else {
-      console.error(`  ${projectPath}: Decay failed - ${result.error.message}`);
+      logger.error(`Decay failed for ${projectPath}`, { error: result.error.message });
     }
 
     // Also cleanup stale candidates
@@ -179,7 +243,7 @@ async function runScheduledDecayForAllProjects(_config: DaemonConfig): Promise<v
 
     const cleanupResult = await cleanupStaleCandidates(promotionConfig);
     if (cleanupResult.ok && cleanupResult.value.removed > 0) {
-      console.log(`  ${projectPath}: Cleaned up ${cleanupResult.value.removed} stale promotion candidates`);
+      logger.info(`Cleaned up ${cleanupResult.value.removed} stale promotion candidates`, { project: projectPath });
     }
   }
 
@@ -225,7 +289,7 @@ async function processProjectEvents(
   // Auto-init project memory if needed
   const initialized = await isProjectMemoryInitialized(projectPath);
   if (!initialized) {
-    console.log(`  Auto-initializing memory for project: ${projectPath}`);
+    logger.info(`Auto-initializing memory for project: ${projectPath}`);
     const initResult = await initProjectMemory(projectPath);
     if (!initResult.ok) {
       return { success: false, memoriesExtracted: 0, memoriesUpdated: 0, error: initResult.error.message };
@@ -248,7 +312,10 @@ async function processProjectEvents(
     const decision = await extractMemoWithContext(event, memoryDir, extractorConfig);
 
     if (!decision.ok) {
-      console.warn(`  ${projectPath}: Extraction failed for event ${event.id}: ${decision.error.message}`);
+      logger.warn(`Extraction failed for event ${event.id}`, {
+        project: projectPath,
+        error: decision.error.message,
+      });
       continue;
     }
 
@@ -261,15 +328,20 @@ async function processProjectEvents(
           const storeResult = await appendToShortTermMemory(storeConfig, 'today', [memoryEntry]);
           if (storeResult.ok) {
             memoriesExtracted++;
-            console.log(`  ${projectPath}: Created memo: ${memo.title}`);
+            logger.info(`Created memo: ${memo.title}`, {
+              type: memo.type,
+              project: projectPath,
+              source: memo.source,
+            });
+            logger.debug('Memo content', { content: memo.content });
 
             // Evaluate for promotion
             const promoResult = await evaluateForPromotion([memoryEntry], promotionConfig);
             if (promoResult.ok && promoResult.value.promoted > 0) {
-              console.log(`  ${projectPath}: Promoted to long-term storage`);
+              logger.info(`Promoted memo to long-term storage`, { project: projectPath });
             }
           } else {
-            console.warn(`  ${projectPath}: Failed to store memo: ${storeResult.error.message}`);
+            logger.warn(`Failed to store memo: ${storeResult.error.message}`, { project: projectPath });
           }
         }
         break;
@@ -284,7 +356,7 @@ async function processProjectEvents(
           );
           if (updateResult.ok) {
             memoriesUpdated++;
-            console.log(`  ${projectPath}: Updated memo ${updateTarget}`);
+            logger.info(`Updated memo ${updateTarget}`, { project: projectPath });
           } else {
             // If today fails, try this-week
             const weekResult = await updateMemoryEntry(
@@ -295,16 +367,16 @@ async function processProjectEvents(
             );
             if (weekResult.ok) {
               memoriesUpdated++;
-              console.log(`  ${projectPath}: Updated memo ${updateTarget} (this-week)`);
+              logger.info(`Updated memo ${updateTarget} (this-week)`, { project: projectPath });
             } else {
-              console.warn(`  ${projectPath}: Failed to update memo ${updateTarget}: ${updateResult.error.message}`);
+              logger.warn(`Failed to update memo ${updateTarget}: ${updateResult.error.message}`, { project: projectPath });
             }
           }
         }
         break;
 
       case 'skip':
-        console.log(`  ${projectPath}: Skipped - ${reasoning}`);
+        logger.debug(`Skipped event`, { project: projectPath, reason: reasoning });
         break;
     }
   }
@@ -328,7 +400,7 @@ async function processEvents(config: DaemonConfig): Promise<void> {
     timeout: 60000,
   };
 
-  console.log('Starting event processor...');
+  logger.info('Starting event processor...');
 
   for await (const batchResult of watchQueue(watcherConfig)) {
     if (!state.running) {
@@ -341,12 +413,12 @@ async function processEvents(config: DaemonConfig): Promise<void> {
     }
 
     if (!batchResult.ok) {
-      console.error('Queue error:', batchResult.error.message);
+      logger.error('Queue error', { error: batchResult.error.message });
       continue;
     }
 
     const { events, filenames } = batchResult.value;
-    console.log(`Processing batch of ${events.length} events...`);
+    logger.info(`Processing batch of ${events.length} events...`);
 
     // Group events by project
     const eventsByProject = groupEventsByProject(events);
@@ -355,7 +427,12 @@ async function processEvents(config: DaemonConfig): Promise<void> {
     let totalUpdated = 0;
 
     for (const [projectPath, projectEvents] of eventsByProject) {
-      console.log(`  Processing ${projectEvents.length} events for: ${projectPath}`);
+      logger.info(`Processing ${projectEvents.length} events for ${projectPath}`);
+      logger.debug('Event details', {
+        project: projectPath,
+        event_count: projectEvents.length,
+        files: projectEvents.flatMap(e => e.files_touched).slice(0, 5),
+      });
 
       const result = await processProjectEvents(projectPath, projectEvents, extractorConfig);
 
@@ -364,12 +441,12 @@ async function processEvents(config: DaemonConfig): Promise<void> {
         totalCreated += result.memoriesExtracted;
         totalUpdated += result.memoriesUpdated;
         if (result.memoriesExtracted > 0 || result.memoriesUpdated > 0) {
-          console.log(
-            `  ${projectPath}: Created ${result.memoriesExtracted}, Updated ${result.memoriesUpdated}`
-          );
+          logger.info(`${projectPath}: Created ${result.memoriesExtracted}, Updated ${result.memoriesUpdated}`);
+        } else {
+          logger.debug(`${projectPath}: No memos created (events may have been trivial)`);
         }
       } else {
-        console.error(`  ${projectPath}: Failed - ${result.error}`);
+        logger.error(`${projectPath}: Failed`, { error: result.error });
         allSucceeded = false;
       }
     }
@@ -397,11 +474,14 @@ async function processEvents(config: DaemonConfig): Promise<void> {
 // ============================================================================
 
 async function startup(config: DaemonConfig): Promise<void> {
-  console.log('Initializing global memory daemon...');
-  console.log(`  Global dir: ${getGlobalDir()}`);
-  console.log(`  Queue dir: ${config.queue_dir}`);
-  console.log(`  Proxy URL: ${config.proxy_url}`);
-  console.log(`  Batch size: ${config.batch_size}`);
+  logger.info('Initializing global memory daemon...');
+  logger.info(`Global dir: ${getGlobalDir()}`);
+  logger.info(`Queue dir: ${config.queue_dir}`);
+  logger.info(`Proxy URL: ${config.proxy_url}`);
+  logger.debug('Config details', { batch_size: config.batch_size, poll_interval: config.poll_interval_ms });
+  if (logger.isDebug()) {
+    logger.info('Debug mode enabled - verbose logging active');
+  }
 
   // Initialize global directories
   const globalInitResult = await initGlobalDirs();
@@ -414,6 +494,11 @@ async function startup(config: DaemonConfig): Promise<void> {
   if (!queueResult.ok) {
     throw new Error(`Failed to initialize queue: ${queueResult.error.message}`);
   }
+
+  // Write PID file for daemon management
+  const pidFile = getPidFilePath();
+  await fs.writeFile(pidFile, process.pid.toString());
+  logger.debug(`PID file written: ${pidFile}`);
 
   state = {
     running: true,
@@ -428,10 +513,17 @@ async function startup(config: DaemonConfig): Promise<void> {
 }
 
 async function shutdown(): Promise<void> {
-  console.log('\nShutting down memory daemon...');
+  logger.info('Shutting down memory daemon...');
   state.running = false;
   await writeStatus();
-  console.log('Daemon stopped.');
+
+  // Remove PID file
+  const pidFile = getPidFilePath();
+  await fs.unlink(pidFile).catch(() => {
+    // Ignore errors if file doesn't exist
+  });
+
+  logger.info('Daemon stopped.');
 }
 
 // ============================================================================
@@ -451,10 +543,10 @@ async function main(): Promise<void> {
 
   try {
     await startup(config);
-    console.log('\nGlobal memory daemon running. Press Ctrl+C to stop.\n');
+    logger.info('Global memory daemon running. Press Ctrl+C to stop.');
     await processEvents(config);
   } catch (error) {
-    console.error('Daemon error:', error);
+    logger.error('Daemon error', { error: error instanceof Error ? error.message : String(error) });
     process.exit(1);
   }
 }

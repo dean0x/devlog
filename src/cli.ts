@@ -387,6 +387,33 @@ async function runDaemon(): Promise<void> {
   await import(daemonPath);
 }
 
+async function stopDaemon(): Promise<void> {
+  const pidFile = join(homedir(), '.devlog', 'daemon.pid');
+
+  try {
+    const pidContent = await fs.readFile(pidFile, 'utf-8');
+    const pid = parseInt(pidContent.trim(), 10);
+
+    if (isNaN(pid)) {
+      console.log('Invalid PID in daemon.pid file.');
+      return;
+    }
+
+    process.kill(pid, 'SIGTERM');
+    console.log(`Sent SIGTERM to daemon (PID ${pid})`);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      console.log('No daemon PID file found. Daemon may not be running.');
+    } else if (err.code === 'ESRCH') {
+      console.log('Daemon process not found. Cleaning up stale PID file.');
+      await fs.unlink(pidFile).catch(() => {});
+    } else {
+      console.error('Failed to stop daemon:', error);
+    }
+  }
+}
+
 async function showStatus(): Promise<void> {
   const globalDir = getGlobalDir();
   const statusPath = getGlobalStatusPath();
@@ -527,7 +554,8 @@ Commands:
   setup [--yes]     Full setup (init + hooks + start services)
   init              Initialize global ~/.devlog directory only
   proxy             Start the Anthropic-to-Ollama proxy server
-  daemon            Start the global memory daemon
+  daemon [start] [-d]  Start the global memory daemon (--debug for verbose)
+  daemon stop          Stop the running daemon
   status            Show daemon status (global + current project)
   hooks             Print hook configuration for ~/.claude/settings.json
   read [period]     Read memories (today, this-week, this-month)
@@ -545,6 +573,7 @@ Environment Variables:
   OLLAMA_BASE_URL   Ollama server URL (default: from config or http://localhost:11434)
   OLLAMA_MODEL      Ollama model (default: from config or llama3.2)
   DEVLOG_HOME       Override global directory (default: ~/.devlog)
+  DEVLOG_DEBUG      Enable debug logging (set to 1 or use --debug flag)
 
 Quick Start:
   devlog setup             # One command does everything!
@@ -576,9 +605,26 @@ switch (command) {
     runProxy();
     break;
 
-  case 'daemon':
-    runDaemon();
+  case 'daemon': {
+    const daemonArgs = process.argv.slice(3);
+    const subcommand = daemonArgs.find(arg => ['start', 'stop'].includes(arg));
+    const debugFlag = daemonArgs.includes('--debug') || daemonArgs.includes('-d');
+
+    if (subcommand === 'stop') {
+      stopDaemon();
+    } else if (subcommand === 'start' || !subcommand || daemonArgs.length === 0 || (daemonArgs.length === 1 && debugFlag)) {
+      // Set debug mode environment variable before running daemon
+      if (debugFlag) {
+        process.env['DEVLOG_DEBUG'] = '1';
+      }
+      runDaemon();
+    } else {
+      console.error(`Unknown daemon subcommand: ${subcommand}`);
+      console.log('Usage: devlog daemon [start|stop] [--debug]');
+      process.exit(1);
+    }
     break;
+  }
 
   case 'status':
     showStatus();

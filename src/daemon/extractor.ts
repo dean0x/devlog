@@ -15,6 +15,26 @@
 
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+
+// ============================================================================
+// Debug Logging
+// ============================================================================
+
+function debugLog(msg: string, data?: Record<string, unknown>): void {
+  if (process.env['DEVLOG_DEBUG'] !== '1') return;
+
+  const timestamp = new Date().toTimeString().slice(0, 8);
+  let dataStr = '';
+  if (data) {
+    const pairs = Object.entries(data).map(([k, v]) => {
+      const str = typeof v === 'string' ? v : JSON.stringify(v);
+      return `${k}=${str.length > 100 ? str.slice(0, 97) + '...' : str}`;
+    });
+    dataStr = pairs.length > 0 ? ` (${pairs.join(', ')})` : '';
+  }
+  console.log(`[${timestamp}] [DEBUG] [extractor] ${msg}${dataStr}`);
+}
+
 import type {
   QueuedEvent,
   MemoryEntry,
@@ -40,6 +60,21 @@ export interface ExtractorConfig {
   readonly proxyUrl: string;
   readonly timeout: number;
 }
+
+// ============================================================================
+// Content Limits
+// ============================================================================
+
+/**
+ * Limits for extracted memo content
+ * ARCHITECTURE: Increased content limit to preserve meaningful insights
+ */
+const CONTENT_LIMITS = {
+  TITLE_MAX: 100,
+  CONTENT_MAX: 1500, // Was 500 - increased to preserve insight quality
+  FILES_MAX: 10,
+  TAGS_MAX: 10,
+} as const;
 
 // ============================================================================
 // Extraction Marker File - Prevents hook feedback loop
@@ -199,13 +234,13 @@ function parseExtractionResponse(response: string): Result<ExtractionResult, Dae
 
     const memo: ExtractedMemo = {
       type,
-      title: String(parsed.memo.title).slice(0, 80),
-      content: String(parsed.memo.content).slice(0, 500),
+      title: String(parsed.memo.title).slice(0, CONTENT_LIMITS.TITLE_MAX),
+      content: String(parsed.memo.content).slice(0, CONTENT_LIMITS.CONTENT_MAX),
       files: Array.isArray(parsed.memo.files)
-        ? parsed.memo.files.filter((f): f is string => typeof f === 'string').slice(0, 10)
+        ? parsed.memo.files.filter((f): f is string => typeof f === 'string').slice(0, CONTENT_LIMITS.FILES_MAX)
         : [],
       tags: Array.isArray(parsed.memo.tags)
-        ? parsed.memo.tags.filter((t): t is string => typeof t === 'string').slice(0, 10)
+        ? parsed.memo.tags.filter((t): t is string => typeof t === 'string').slice(0, CONTENT_LIMITS.TAGS_MAX)
         : undefined,
     };
 
@@ -231,6 +266,8 @@ async function runClaudeExtraction(
   prompt: string,
   config: ExtractorConfig
 ): Promise<Result<string, DaemonError>> {
+  debugLog('Starting Claude extraction', { proxy_url: config.proxyUrl, prompt_length: prompt.length });
+
   // Create marker file before spawning to signal extraction in progress
   await fs.writeFile(EXTRACTION_MARKER, process.pid.toString());
 
@@ -241,6 +278,7 @@ async function runClaudeExtraction(
         ANTHROPIC_BASE_URL: config.proxyUrl,
       };
 
+      debugLog('Spawning claude -p command');
       const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -260,6 +298,7 @@ async function runClaudeExtraction(
 
       child.on('close', (code) => {
         if (code !== 0) {
+          debugLog('Claude extraction failed', { exit_code: code, stderr });
           resolve(Err({
             type: 'extraction_error',
             message: `Claude exited with code ${code}: ${stderr}`,
@@ -267,10 +306,12 @@ async function runClaudeExtraction(
           return;
         }
 
+        debugLog('Claude extraction succeeded', { response_length: stdout.length });
         resolve(Ok(stdout));
       });
 
       child.on('error', (error) => {
+        debugLog('Failed to spawn Claude', { error: error.message });
         resolve(Err({
           type: 'extraction_error',
           message: `Failed to spawn Claude: ${error.message}`,
@@ -286,64 +327,122 @@ async function runClaudeExtraction(
 }
 
 /**
- * Fallback extraction without Claude (simple heuristics)
+ * Minimum response length to consider for fallback extraction
+ * Shorter responses are likely trivial Q&A or simple edits
+ */
+const FALLBACK_MIN_RESPONSE_LENGTH = 500;
+
+/**
+ * Fallback extraction without Claude (strict heuristics)
  * Used when proxy/Claude isn't available
+ *
+ * ARCHITECTURE: Much stricter than Claude extraction
+ * Pattern: Only create memos for substantial interactions with files
  */
 function fallbackExtraction(event: QueuedEvent): ExtractionResult {
+  debugLog('Running fallback extraction', {
+    user_prompt_length: event.user_prompt.length,
+    response_length: event.assistant_response.length,
+    files_count: event.files_touched.length,
+  });
+
   // Skip extraction prompts to prevent garbage memos from feedback loop
   // This is a safety net in case marker file check fails
   if (
     event.user_prompt.includes("You are a developer's memory system") ||
     event.user_prompt.includes('EXISTING MEMORY CONTEXT')
   ) {
+    debugLog('Skipping: extraction prompt detected');
     return { memo: null };
   }
 
-  // Only create memos for substantial interactions
-  if (event.user_prompt.length < 20 && event.assistant_response.length < 100) {
+  // STRICT: Skip if no files were touched - likely just a conversation
+  if (event.files_touched.length === 0) {
+    debugLog('Skipping: no files touched');
     return { memo: null };
   }
 
-  // Skip trivial queries
-  const trivialPatterns = [
-    /^(fix|typo|rename|update|change)/i,
-    /^(what|how|where|why|when|who|which) (is|are|does|do|did|was|were)/i,
-    /^(run|execute|show|list|display|print)/i,
+  // STRICT: Skip if response is too short - not enough substance
+  if (event.assistant_response.length < FALLBACK_MIN_RESPONSE_LENGTH) {
+    debugLog('Skipping: response too short', { length: event.assistant_response.length });
+    return { memo: null };
+  }
+
+  // STRICT: Skip obvious questions (these don't create insights)
+  const questionPatterns = [
+    /^(what|how|where|why|when|who|which|can|could|would|should|is|are|does|do|did|was|were)\s/i,
+    /\?$/,
   ];
 
-  for (const pattern of trivialPatterns) {
+  for (const pattern of questionPatterns) {
     if (pattern.test(event.user_prompt.trim())) {
+      debugLog('Skipping: appears to be a question');
       return { memo: null };
     }
   }
 
-  // Create a basic context memo
-  const title = event.user_prompt.slice(0, 80).replace(/\n/g, ' ');
-  const content = event.assistant_response.slice(0, 200).replace(/\n/g, ' ');
+  // Skip trivial command requests
+  const trivialPatterns = [
+    /^(fix|typo|rename|update|change)\s/i,
+    /^(run|execute|show|list|display|print|read|cat|ls)\s/i,
+    /^(add|remove|delete)\s+(a\s+)?(comment|console\.log|log|import)/i,
+  ];
+
+  for (const pattern of trivialPatterns) {
+    if (pattern.test(event.user_prompt.trim())) {
+      debugLog('Skipping: trivial command pattern');
+      return { memo: null };
+    }
+  }
+
+  // Create a basic context memo with FALLBACK marker
+  // These have lower confidence since Claude didn't validate them
+  const title = event.user_prompt.slice(0, CONTENT_LIMITS.TITLE_MAX).replace(/\n/g, ' ').trim();
+  const content = event.assistant_response.slice(0, 300).replace(/\n/g, ' ').trim();
+
+  // Skip if resulting content is too short
+  if (content.length < 50) {
+    debugLog('Skipping: resulting content too short');
+    return { memo: null };
+  }
 
   const memo: ExtractedMemo = {
     type: 'context',
-    title,
-    content: content.length > 0 ? content : 'Working on task',
+    title: title || 'Development work',
+    content: content,
     files: [...event.files_touched],
+    source: 'fallback',
   };
 
+  debugLog('Fallback memo created', { title: memo.title, files_count: memo.files.length });
   return { memo };
 }
+
+/**
+ * Confidence levels based on extraction source
+ * - Claude extraction: Higher confidence (validated by LLM)
+ * - Fallback extraction: Lower confidence (heuristic-based)
+ */
+const CONFIDENCE_LEVELS = {
+  claude: 0.8,
+  fallback: 0.4,
+} as const;
 
 /**
  * Convert an extracted memo to a memory entry for storage
  */
 export function memoToMemoryEntry(memo: ExtractedMemo): MemoryEntry {
+  const source = memo.source ?? 'claude';
   return {
     id: uuidv4(),
     timestamp: new Date().toISOString(),
     type: memo.type,
     title: memo.title,
     content: memo.content,
-    confidence: 0.8, // Fixed confidence for extracted memos
+    confidence: CONFIDENCE_LEVELS[source],
     files: memo.files.length > 0 ? memo.files : undefined,
     tags: memo.tags,
+    source,
   };
 }
 
@@ -436,17 +535,33 @@ Review this turn considering existing memos. Decide:
 Output JSON:
 {
   "action": "create|update|skip",
-  "memo": { "type": "goal|decision|problem|context|insight", "title": "One-line summary (max 80 chars)", "content": "2-3 sentences max", "files": ["relevant", "files"] },
+  "memo": { "type": "goal|decision|problem|context|insight", "title": "One-line summary (max 100 chars)", "content": "Detailed insight with reasoning (2-5 sentences)", "files": ["relevant", "files"] },
   "updateTarget": "memo-id-if-updating",
   "updateFields": { "content": "refined content" },
   "reasoning": "Brief explanation"
 }
 
-RULES:
+## QUALITY EXAMPLES
+
+### GOOD MEMOS (valuable insights):
+- DECISION: "Switched session storage from JWT to Redis because JWTs can't be invalidated on logout, which is a security requirement for this app"
+- INSIGHT: "The codebase uses a custom Result<T,E> type for error handling - functions return {ok: true, value} or {ok: false, error} instead of throwing"
+- PROBLEM: "Race condition in checkout flow - two concurrent requests can both pass inventory check before either decrements stock"
+- GOAL: "Implementing OAuth2 for mobile app - need to handle token refresh, secure storage, and deep linking for callback"
+
+### BAD MEMOS (just logs, no value):
+- "User asked about sessions. Changed to use Redis." (missing WHY)
+- "Fixed bug in auth" (too vague, no insight)
+- "Working on feature X" (empty context)
+- "Added console.log for debugging" (trivial)
+
+## RULES
 - Prefer UPDATE over CREATE if this refines existing context
-- SKIP trivial interactions (typos, simple queries, minor edits)
-- CREATE only for genuinely new decisions, goals, or insights
-- Focus on WHY and WHAT WAS DECIDED, not implementation details
+- SKIP trivial interactions (typos, simple queries, minor edits, debugging)
+- SKIP if just echoing what user asked without adding insight
+- CREATE only for genuinely new decisions, goals, problems, or insights
+- Content MUST explain WHY, not just WHAT
+- Capture the REASONING behind choices, not just the actions taken
 
 Memory types:
 - goal: Current objective being worked on
@@ -588,23 +703,23 @@ function parseExtractionDecision(
         updateFields: parsed.updateFields
           ? {
               ...(parsed.updateFields.title !== undefined && {
-                title: String(parsed.updateFields.title).slice(0, 80),
+                title: String(parsed.updateFields.title).slice(0, CONTENT_LIMITS.TITLE_MAX),
               }),
               ...(parsed.updateFields.content !== undefined && {
-                content: String(parsed.updateFields.content).slice(0, 500),
+                content: String(parsed.updateFields.content).slice(0, CONTENT_LIMITS.CONTENT_MAX),
               }),
               ...(parsed.updateFields.files !== undefined && {
                 files: Array.isArray(parsed.updateFields.files)
                   ? parsed.updateFields.files
                       .filter((f): f is string => typeof f === 'string')
-                      .slice(0, 10)
+                      .slice(0, CONTENT_LIMITS.FILES_MAX)
                   : undefined,
               }),
               ...(parsed.updateFields.tags !== undefined && {
                 tags: Array.isArray(parsed.updateFields.tags)
                   ? parsed.updateFields.tags
                       .filter((t): t is string => typeof t === 'string')
-                      .slice(0, 10)
+                      .slice(0, CONTENT_LIMITS.TAGS_MAX)
                   : undefined,
               }),
             }
@@ -634,17 +749,17 @@ function parseExtractionDecision(
 
     const memo: ExtractedMemo = {
       type,
-      title: String(parsed.memo.title).slice(0, 80),
-      content: String(parsed.memo.content).slice(0, 500),
+      title: String(parsed.memo.title).slice(0, CONTENT_LIMITS.TITLE_MAX),
+      content: String(parsed.memo.content).slice(0, CONTENT_LIMITS.CONTENT_MAX),
       files: Array.isArray(parsed.memo.files)
         ? parsed.memo.files
             .filter((f): f is string => typeof f === 'string')
-            .slice(0, 10)
+            .slice(0, CONTENT_LIMITS.FILES_MAX)
         : [],
       tags: Array.isArray(parsed.memo.tags)
         ? parsed.memo.tags
             .filter((t): t is string => typeof t === 'string')
-            .slice(0, 10)
+            .slice(0, CONTENT_LIMITS.TAGS_MAX)
         : undefined,
     };
 
@@ -689,8 +804,19 @@ export async function extractMemoWithContext(
   config: ExtractorConfig
 ): Promise<Result<ExtractionDecision, DaemonError>> {
   return withExtractionLock(async () => {
+    debugLog('Starting context-aware extraction', {
+      event_id: event.id,
+      user_prompt: event.user_prompt.slice(0, 50),
+      files_count: event.files_touched.length,
+    });
+
     // 1. Load existing context
     const context = await loadMemoContext(memoryDir, DEFAULT_ATTENTION_CONFIG);
+    debugLog('Loaded memo context', {
+      long_term: context.longTerm.length,
+      this_week: context.thisWeek.length,
+      today: context.today.length,
+    });
 
     // 2. Build context-aware prompt
     const prompt = buildContextAwarePrompt(event, context);
@@ -698,23 +824,36 @@ export async function extractMemoWithContext(
     // 3. Run Claude extraction
     const claudeResult = await runClaudeExtraction(prompt, config);
     if (!claudeResult.ok) {
+      debugLog('Claude extraction failed, using fallback', { error: claudeResult.error.message });
       console.warn(
         'Claude extraction failed, using fallback:',
         claudeResult.error.message
       );
-      return Ok(fallbackDecision(event));
+      const decision = fallbackDecision(event);
+      debugLog('Fallback decision', { action: decision.action, reasoning: decision.reasoning });
+      return Ok(decision);
     }
 
     // 4. Parse decision
+    debugLog('Parsing Claude response', { response_length: claudeResult.value.length });
     const decisionResult = parseExtractionDecision(claudeResult.value);
     if (!decisionResult.ok) {
+      debugLog('Failed to parse decision, using fallback', { error: decisionResult.error.message });
       console.warn(
         'Failed to parse extraction decision, using fallback:',
         decisionResult.error.message
       );
-      return Ok(fallbackDecision(event));
+      const decision = fallbackDecision(event);
+      debugLog('Fallback decision', { action: decision.action, reasoning: decision.reasoning });
+      return Ok(decision);
     }
 
-    return Ok(decisionResult.value);
+    const decision = decisionResult.value;
+    debugLog('Extraction decision', {
+      action: decision.action,
+      memo_title: decision.memo?.title,
+      reasoning: decision.reasoning,
+    });
+    return Ok(decision);
   });
 }
