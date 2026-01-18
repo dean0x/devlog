@@ -14,6 +14,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { promises as fs } from 'node:fs';
 import type {
   QueuedEvent,
   MemoryEntry,
@@ -39,6 +40,20 @@ export interface ExtractorConfig {
   readonly proxyUrl: string;
   readonly timeout: number;
 }
+
+// ============================================================================
+// Extraction Marker File - Prevents hook feedback loop
+// ============================================================================
+
+/**
+ * ARCHITECTURE: Marker file to signal extraction is in progress
+ *
+ * Environment variables cannot cross the Claude Code → hook subprocess boundary.
+ * Claude Code spawns hooks as separate subprocesses with clean environments.
+ * Using a marker file allows hooks to detect when they're being triggered
+ * by daemon extraction vs normal Claude Code usage.
+ */
+export const EXTRACTION_MARKER = '/tmp/devlog-extraction-active';
 
 // ============================================================================
 // Extraction Lock - Ensures only one Claude instance at a time
@@ -205,53 +220,69 @@ function parseExtractionResponse(response: string): Result<ExtractionResult, Dae
 
 /**
  * Run Claude Code in headless mode for extraction
+ *
+ * ARCHITECTURE: Uses marker file to prevent hook feedback loop
+ * Pattern: Write marker before spawn, remove after completion
+ *
+ * The marker file signals to hooks that an extraction is in progress,
+ * so they should skip their normal behavior to avoid infinite loops.
  */
 async function runClaudeExtraction(
   prompt: string,
   config: ExtractorConfig
 ): Promise<Result<string, DaemonError>> {
-  return new Promise((resolve) => {
-    const env = {
-      ...process.env,
-      ANTHROPIC_BASE_URL: config.proxyUrl,
-    };
+  // Create marker file before spawning to signal extraction in progress
+  await fs.writeFile(EXTRACTION_MARKER, process.pid.toString());
 
-    const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: config.timeout,
-    });
+  try {
+    return await new Promise((resolve) => {
+      const env = {
+        ...process.env,
+        ANTHROPIC_BASE_URL: config.proxyUrl,
+      };
 
-    let stdout = '';
-    let stderr = '';
+      const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: config.timeout,
+      });
 
-    child.stdout.on('data', (data: Buffer) => {
-      stdout += data.toString();
-    });
+      let stdout = '';
+      let stderr = '';
 
-    child.stderr.on('data', (data: Buffer) => {
-      stderr += data.toString();
-    });
+      child.stdout.on('data', (data: Buffer) => {
+        stdout += data.toString();
+      });
 
-    child.on('close', (code) => {
-      if (code !== 0) {
+      child.stderr.on('data', (data: Buffer) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          resolve(Err({
+            type: 'extraction_error',
+            message: `Claude exited with code ${code}: ${stderr}`,
+          }));
+          return;
+        }
+
+        resolve(Ok(stdout));
+      });
+
+      child.on('error', (error) => {
         resolve(Err({
           type: 'extraction_error',
-          message: `Claude exited with code ${code}: ${stderr}`,
+          message: `Failed to spawn Claude: ${error.message}`,
         }));
-        return;
-      }
-
-      resolve(Ok(stdout));
+      });
     });
-
-    child.on('error', (error) => {
-      resolve(Err({
-        type: 'extraction_error',
-        message: `Failed to spawn Claude: ${error.message}`,
-      }));
+  } finally {
+    // Remove marker after extraction completes (success or failure)
+    await fs.unlink(EXTRACTION_MARKER).catch(() => {
+      // Ignore errors - marker may not exist if write failed
     });
-  });
+  }
 }
 
 /**
@@ -259,6 +290,15 @@ async function runClaudeExtraction(
  * Used when proxy/Claude isn't available
  */
 function fallbackExtraction(event: QueuedEvent): ExtractionResult {
+  // Skip extraction prompts to prevent garbage memos from feedback loop
+  // This is a safety net in case marker file check fails
+  if (
+    event.user_prompt.includes("You are a developer's memory system") ||
+    event.user_prompt.includes('EXISTING MEMORY CONTEXT')
+  ) {
+    return { memo: null };
+  }
+
   // Only create memos for substantial interactions
   if (event.user_prompt.length < 20 && event.assistant_response.length < 100) {
     return { memo: null };

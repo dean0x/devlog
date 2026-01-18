@@ -8,11 +8,32 @@
  * can change without breaking user configuration.
  */
 
-import { promises as fs } from 'node:fs';
+import { promises as fs, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { enqueueEvent, initQueue } from '../storage/queue.js';
 import { getGlobalQueueDir, initGlobalDirs, isGlobalInitialized } from '../paths.js';
 import type { Result } from '../types/index.js';
+
+// ============================================================================
+// Extraction Detection - Prevents hook feedback loop
+// ============================================================================
+
+/**
+ * Marker file created by daemon during extraction.
+ * Must match EXTRACTION_MARKER in extractor.ts
+ */
+const EXTRACTION_MARKER = '/tmp/devlog-extraction-active';
+
+/**
+ * Check if daemon extraction is in progress
+ *
+ * ARCHITECTURE: Uses filesystem marker instead of environment variables
+ * because Claude Code spawns hooks as separate subprocesses that do not
+ * inherit the parent Claude process's environment variables.
+ */
+function isExtractionInProgress(): boolean {
+  return existsSync(EXTRACTION_MARKER);
+}
 
 // ============================================================================
 // Types
@@ -167,6 +188,11 @@ async function parseTranscript(transcriptPath: string): Promise<ParsedTurn> {
  *   { "tool_name": "Edit", "tool_input": { "file_path": "/path/to/file.ts" } }
  */
 export async function handlePostToolUse(): Promise<Result<void, Error>> {
+  // Skip if daemon extraction is in progress to prevent feedback loop
+  if (isExtractionInProgress()) {
+    return { ok: true, value: undefined };
+  }
+
   try {
     const stdinData = await readStdin();
 
@@ -220,6 +246,11 @@ export async function handlePostToolUse(): Promise<Result<void, Error>> {
  *   { "transcript_path": "/path/to/transcript.jsonl" }
  */
 export async function handleStop(): Promise<Result<void, Error>> {
+  // Skip if daemon extraction is in progress to prevent feedback loop
+  if (isExtractionInProgress()) {
+    return { ok: true, value: undefined };
+  }
+
   try {
     const sessionId = process.env['CLAUDE_SESSION_ID'] ?? 'unknown';
     const projectPath = process.cwd();
