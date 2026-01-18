@@ -15,6 +15,7 @@ import type {
   OllamaMessage,
   OllamaResponse,
   OllamaStreamChunk,
+  SystemContentBlock,
   Result,
   ProxyError,
 } from '../types/index.js';
@@ -31,6 +32,18 @@ const MODEL_MAP: Record<string, string> = {
 };
 
 const DEFAULT_OLLAMA_MODEL = 'llama3.2';
+
+/**
+ * Normalize system field to string
+ * Handles both string format and array of content blocks
+ */
+function normalizeSystem(
+  system: string | readonly SystemContentBlock[] | undefined
+): string | undefined {
+  if (system === undefined) return undefined;
+  if (typeof system === 'string') return system;
+  return system.map((block) => block.text).join('\n\n');
+}
 
 /**
  * Extract text content from Anthropic message content
@@ -90,8 +103,9 @@ export function translateRequest(
   // Determine Ollama model
   const ollamaModel = modelOverride ?? MODEL_MAP[anthropicReq.model] ?? DEFAULT_OLLAMA_MODEL;
 
-  // Translate messages
-  const messages = translateMessages(anthropicReq.messages, anthropicReq.system);
+  // Normalize system field to string and translate messages
+  const systemPrompt = normalizeSystem(anthropicReq.system);
+  const messages = translateMessages(anthropicReq.messages, systemPrompt);
 
   if (messages.length === 0) {
     return Err({

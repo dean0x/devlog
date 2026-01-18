@@ -43,11 +43,21 @@ export interface AnthropicContentBlock {
   readonly content?: string;
 }
 
+/**
+ * System content block for array-format system prompts
+ * Used by Claude Code for cache control hints
+ */
+export interface SystemContentBlock {
+  readonly type: 'text';
+  readonly text: string;
+  readonly cache_control?: { readonly type: string };
+}
+
 export interface AnthropicRequest {
   readonly model: string;
   readonly messages: readonly AnthropicMessage[];
   readonly max_tokens: number;
-  readonly system?: string;
+  readonly system?: string | readonly SystemContentBlock[];
   readonly stream?: boolean;
   readonly temperature?: number;
   readonly stop_sequences?: readonly string[];

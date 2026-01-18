@@ -9,6 +9,7 @@ import type {
   AnthropicRequest,
   AnthropicMessage,
   AnthropicContentBlock,
+  SystemContentBlock,
   Result,
   ProxyError,
 } from '../types/index.js';
@@ -38,6 +39,20 @@ function isValidContentBlock(block: unknown): block is AnthropicContentBlock {
     default:
       return false;
   }
+}
+
+/**
+ * Validate system content block array
+ */
+function isValidSystemContent(content: unknown): content is SystemContentBlock[] {
+  if (!Array.isArray(content)) return false;
+  return content.every(
+    (block) =>
+      typeof block === 'object' &&
+      block !== null &&
+      block.type === 'text' &&
+      typeof block.text === 'string'
+  );
 }
 
 /**
@@ -117,12 +132,14 @@ export function parseAnthropicRequest(body: unknown): Result<AnthropicRequest, P
     }
   }
 
-  // Validate optional fields
-  if (obj['system'] !== undefined && typeof obj['system'] !== 'string') {
-    return Err({
-      type: 'invalid_request',
-      message: 'Invalid "system" field - must be a string',
-    });
+  // Validate optional fields - system can be string or array of text blocks
+  if (obj['system'] !== undefined) {
+    if (typeof obj['system'] !== 'string' && !isValidSystemContent(obj['system'])) {
+      return Err({
+        type: 'invalid_request',
+        message: 'Invalid "system" field - must be a string or array of text blocks',
+      });
+    }
   }
 
   if (obj['stream'] !== undefined && typeof obj['stream'] !== 'boolean') {
@@ -152,7 +169,7 @@ export function parseAnthropicRequest(body: unknown): Result<AnthropicRequest, P
     model: obj['model'],
     messages: obj['messages'] as AnthropicMessage[],
     max_tokens: obj['max_tokens'],
-    system: obj['system'] as string | undefined,
+    system: obj['system'] as string | SystemContentBlock[] | undefined,
     stream: obj['stream'] as boolean | undefined,
     temperature: obj['temperature'] as number | undefined,
     stop_sequences: obj['stop_sequences'] as string[] | undefined,
