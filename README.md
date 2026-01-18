@@ -6,12 +6,14 @@ A background memory extraction system for Claude Code that captures, stores, and
 
 Devlog monitors your Claude Code sessions via hooks and extracts meaningful memories using a local LLM (Ollama). Memories are organized into short-term and long-term storage with automatic decay and promotion mechanisms.
 
+**Setup once, works everywhere** - The global daemon architecture means you configure devlog once and it automatically works across all your projects.
+
 ## Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                      MAIN CLAUDE CODE SESSION                              │
-│                    (Your normal development work)                          │
+│                      CLAUDE CODE SESSIONS                                  │
+│                    (Any project, anywhere)                                 │
 └────────────────────────────┬───────────────────────────────────────────────┘
                              │
             ┌────────────────┼────────────────┐
@@ -24,30 +26,32 @@ Devlog monitors your Claude Code sessions via hooks and extracts meaningful memo
                     │               │
                     ▼               ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                    EVENT QUEUE (.memory/queue/)                           │
-│                    pending/*.json → processing → completed                │
+│             GLOBAL EVENT QUEUE (~/.devlog/queue/)                         │
+│         pending/*.json → processing → completed                           │
+│         Events include project_path for routing                           │
 └───────────────────────────────────┬───────────────────────────────────────┘
                                     │
                                     ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                    MEMORY DAEMON (memoryd)                                │
+│                    GLOBAL MEMORY DAEMON (memoryd)                         │
 │  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ Claude Code (headless) ──► Anthropic Proxy ──► Ollama (llama3.2)   │ │
+│  │ Anthropic Proxy ──► Ollama (llama3.2) ──► Memory Extraction        │ │
 │  └─────────────────────────────────────────────────────────────────────┘ │
-│  - Watches event queue                                                    │
-│  - Spawns claude -p for extraction tasks                                  │
-│  - Manages memory decay/compaction                                        │
+│  - Watches global queue                                                   │
+│  - Routes memories to correct project based on project_path               │
+│  - Auto-initializes project .memory/ directories                          │
+│  - Manages memory decay/compaction per project                            │
 └───────────────────────────────────┬───────────────────────────────────────┘
                                     │
-                    ┌───────────────┴───────────────┐
-                    ▼                               ▼
-┌───────────────────────────────────┐  ┌───────────────────────────────────────┐
-│   SHORT-TERM MEMORY           │  │   LONG-TERM MEMORY                    │
-│   .memory/short/              │  │   .memory/long/                       │
-│   ├── today.md                │  │   ├── conventions.md                  │
-│   ├── this-week.md            │  │   ├── architecture.md                 │
-│   └── this-month.md           │  │   └── rules-of-thumb.md               │
-└───────────────────────────────┘  └───────────────────────────────────────┘
+          ┌─────────────────────────┼─────────────────────────┐
+          ▼                         ▼                         ▼
+┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+│ Project A       │       │ Project B       │       │ Project C       │
+│ /.memory/       │       │ /.memory/       │       │ /.memory/       │
+│ ├── short/      │       │ ├── short/      │       │ ├── short/      │
+│ │   └── today.md│       │ │   └── today.md│       │ │   └── today.md│
+│ └── long/       │       │ └── long/       │       │ └── long/       │
+└─────────────────┘       └─────────────────┘       └─────────────────┘
 ```
 
 ## Prerequisites
@@ -56,89 +60,105 @@ Devlog monitors your Claude Code sessions via hooks and extracts meaningful memo
 - [Ollama](https://ollama.ai/) running locally with `llama3.2` model
 - Claude Code CLI installed
 
-## How to Use Devlog on Your Own Project
-
-### One-Time Global Setup
+## Quick Start (One-Time Global Setup)
 
 ```bash
 # 1. Build and install globally
-cd /workspace/devlog
+cd /path/to/devlog
 npm install
 npm run build
 npm link
 
-# 2. Configure Claude Code hooks (run once)
+# 2. Initialize global devlog
+devlog init
+# Creates ~/.devlog/ with queue directories and config
+
+# 3. Configure Claude Code hooks
 devlog hooks
 # Copy the output to ~/.claude/settings.json
-```
 
-### Per-Project Setup
+# 4. Start the proxy (in background or separate terminal)
+devlog proxy &
 
-```bash
-# 1. Navigate to your project
-cd /path/to/your/project
+# 5. Start the global daemon (in background or separate terminal)
+devlog daemon &
 
-# 2. Initialize memory storage
-devlog init
-
-# 3. Start the proxy (Terminal 1)
-devlog proxy
-
-# 4. Start the daemon (Terminal 2, in your project dir)
-cd /path/to/your/project
-devlog daemon
-
-# 5. Use Claude Code normally
+# That's it! Now use Claude Code in any project:
+cd /any/project
 claude
+# Memories are automatically captured to /any/project/.memory/
 ```
 
-### View Captured Memories
+## Using Devlog
+
+Once set up, devlog works automatically in any project directory:
 
 ```bash
-cd /path/to/your/project
+# Use Claude Code normally in any project
+cd /project-a
+claude   # Memories auto-saved to /project-a/.memory/
+
+cd /project-b
+claude   # Memories auto-saved to /project-b/.memory/
+
+# View captured memories for current project
 devlog read today
 devlog read this-week
 devlog read this-month
+
+# Check global daemon status
+devlog status
 ```
 
-### Directory Structure Created
+## Directory Structure
+
+### Global (setup once)
 
 ```
-/your/project/
-├── .memory/
-│   ├── short/
-│   │   ├── today.md          # Today's memories
-│   │   ├── this-week.md      # This week's condensed
-│   │   ├── this-month.md     # Monthly summaries
-│   │   └── archive/          # Historical
-│   ├── long/
-│   │   ├── conventions.md    # Auto-promoted patterns
-│   │   ├── architecture.md
-│   │   └── rules-of-thumb.md
-│   ├── queue/
-│   │   ├── pending/          # Events waiting
-│   │   ├── processing/       # Being processed
-│   │   └── failed/           # Failed events
-│   └── candidates.json       # Promotion candidates
-└── ... your project files
+~/.devlog/
+├── config.json           # Global configuration
+├── daemon.status         # Daemon status (running, events processed, etc.)
+└── queue/
+    ├── pending/          # Events from all projects
+    ├── processing/       # Events being processed
+    └── failed/           # Failed events
 ```
 
-### Quick Reference
+### Per-Project (auto-created)
+
+```
+/your/project/.memory/
+├── short/
+│   ├── today.md          # Today's memories
+│   ├── this-week.md      # This week's condensed
+│   ├── this-month.md     # Monthly summaries
+│   └── archive/          # Historical
+├── long/
+│   ├── conventions.md    # Auto-promoted patterns
+│   ├── architecture.md
+│   └── rules-of-thumb.md
+└── candidates.json       # Promotion candidates
+```
+
+## CLI Reference
 
 | Command | Purpose |
 |---------|---------|
-| `devlog init` | Set up .memory in current directory |
+| `devlog init` | Initialize global ~/.devlog directory (one-time) |
 | `devlog proxy` | Start Ollama proxy (port 8082) |
-| `devlog daemon` | Process events and extract memories |
-| `devlog status` | Check daemon status |
-| `devlog read today` | View today's memories |
+| `devlog daemon` | Start global memory daemon |
+| `devlog status` | Check daemon status + current project info |
+| `devlog read today` | View today's memories for current project |
+| `devlog read this-week` | View this week's memories |
+| `devlog read this-month` | View this month's memories |
 | `devlog hooks` | Get hook config for settings.json |
+| `devlog config` | Show current configuration |
 
 ## Memory Storage
 
 ### Short-Term Memory
 
-Located in `.memory/short/`:
+Located in `{project}/.memory/short/`:
 
 - `today.md` - Full detail from today's sessions
 - `this-week.md` - Condensed high-confidence memories
@@ -158,7 +178,7 @@ Example entry:
 
 ### Long-Term Memory
 
-Located in `.memory/long/`:
+Located in `{project}/.memory/long/`:
 
 - `conventions.md` - Coding conventions observed
 - `architecture.md` - Architecture decisions
@@ -178,15 +198,27 @@ Memories are automatically compacted over time:
 
 ## Configuration
 
+### Global Config File
+
+Edit `~/.devlog/config.json`:
+
+```json
+{
+  "ollama_base_url": "http://localhost:11434",
+  "ollama_model": "llama3.2",
+  "proxy_port": 8082
+}
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_PORT` | 8082 | Port for the Anthropic proxy |
-| `OLLAMA_BASE_URL` | http://localhost:11434 | Ollama server URL |
-| `OLLAMA_MODEL` | llama3.2 | Ollama model to use |
-| `MEMORY_DIR` | ./.memory | Memory storage directory |
-| `QUEUE_DIR` | ./.memory/queue | Event queue directory |
+| `PROXY_PORT` | from config or 8082 | Port for the Anthropic proxy |
+| `OLLAMA_BASE_URL` | from config or http://localhost:11434 | Ollama server URL |
+| `OLLAMA_MODEL` | from config or llama3.2 | Ollama model to use |
+| `DEVLOG_HOME` | ~/.devlog | Override global directory |
+| `DEVLOG_QUEUE_DIR` | ~/.devlog/queue | Override queue directory |
 | `BATCH_SIZE` | 5 | Events to process per batch |
 | `POLL_INTERVAL` | 5000 | Queue poll interval (ms) |
 
@@ -232,17 +264,26 @@ curl -X POST http://localhost:8082/v1/messages \
 ### Test Hooks
 
 ```bash
-# Run Claude Code session
+# Run Claude Code session in any project
+cd /any/project
 claude -p "Create a file test.txt"
 
-# Check queue
-ls .memory/queue/pending/
+# Check global queue
+ls ~/.devlog/queue/pending/
 ```
 
 ### Check Memories
 
 ```bash
+cd /any/project
 devlog read today
+```
+
+### Check Status
+
+```bash
+devlog status
+# Shows global daemon status and current project info
 ```
 
 ## Programmatic Usage
@@ -265,7 +306,7 @@ const app = createProxyApp({
 
 // Read memories
 const result = await readShortTermMemory(
-  { baseDir: './.memory' },
+  { baseDir: '/path/to/project/.memory' },
   'today'
 );
 if (result.ok) {
@@ -285,13 +326,19 @@ if (result.ok) {
 
 1. Check hook paths in settings.json are absolute
 2. Verify hook scripts are executable: `chmod +x dist/hooks/*.sh`
-3. Check MEMORY_DIR environment variable
+3. Run `devlog status` to see queue stats
 
 ### Extraction returning empty memories
 
-1. Ensure daemon is running
+1. Ensure daemon is running: `devlog status`
 2. Check proxy is accessible
 3. Review daemon logs for errors
+
+### Project memories not appearing
+
+1. Verify daemon is routing correctly: `devlog status` shows the project
+2. Check `{project}/.memory/` directory was auto-created
+3. Run `devlog read today` from the project directory
 
 ## Development
 

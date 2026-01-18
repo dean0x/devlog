@@ -131,18 +131,23 @@ export interface OllamaStreamChunk {
 // Event Queue Types
 // ============================================================================
 
-export type EventType = 'tool_use' | 'session_end' | 'conversation_turn';
+export type EventType = 'turn_complete';
 
+/**
+ * TurnEvent - Captured at the end of each Claude response
+ *
+ * ARCHITECTURE: Events are turn-based, not tool-based
+ * Pattern: One event per Claude response with memo extraction
+ */
 export interface QueuedEvent {
   readonly id: string;
   readonly timestamp: string;
   readonly event_type: EventType;
   readonly session_id: string;
-  readonly transcript_path?: string;
-  readonly tool_name?: string;
-  readonly tool_input?: unknown;
-  readonly tool_result?: string;
-  readonly conversation_summary?: string;
+  readonly project_path: string;
+  readonly user_prompt: string;
+  readonly assistant_response: string;
+  readonly files_touched: readonly string[];
 }
 
 export interface ProcessingResult {
@@ -156,7 +161,16 @@ export interface ProcessingResult {
 // Memory Types
 // ============================================================================
 
-export type MemoryType = 'decision' | 'pattern' | 'problem' | 'solution' | 'convention';
+/**
+ * Memory Types (Refined for concise memos)
+ *
+ * goal     - Current objective: "Implementing OAuth2 for mobile"
+ * decision - Choice made: "Using JWT because sessions don't scale"
+ * problem  - Issue to remember: "Race condition in checkout flow"
+ * context  - WIP state: "Halfway through refactoring auth module"
+ * insight  - Learning: "This codebase uses repository pattern"
+ */
+export type MemoryType = 'goal' | 'decision' | 'problem' | 'context' | 'insight';
 
 export interface MemoryEntry {
   readonly id: string;
@@ -225,20 +239,73 @@ export interface DaemonStatus {
   readonly events_processed: number;
   readonly last_extraction?: string;
   readonly last_decay?: string;
+  readonly projects?: { readonly [path: string]: ProjectStats };
+}
+
+export interface ProjectStats {
+  readonly events_processed: number;
+  readonly memories_extracted: number;
+  readonly last_activity?: string;
+}
+
+export interface GlobalConfig {
+  readonly ollama_base_url: string;
+  readonly ollama_model: string;
+  readonly proxy_port: number;
 }
 
 // ============================================================================
 // Extraction Types
 // ============================================================================
 
-export interface ExtractionPrompt {
-  readonly events: readonly QueuedEvent[];
-  readonly context?: string;
+/**
+ * Memo extraction result - null means skip (trivial interaction)
+ */
+export interface ExtractedMemo {
+  readonly type: MemoryType;
+  readonly title: string;
+  readonly content: string;
+  readonly files: readonly string[];
+  readonly tags?: readonly string[];
 }
 
 export interface ExtractionResult {
-  readonly memories: readonly MemoryEntry[];
-  readonly promotion_candidates?: readonly PromotionCandidate[];
+  readonly memo: ExtractedMemo | null;
+}
+
+/**
+ * Context-aware extraction decision
+ *
+ * ARCHITECTURE: Supports create, update, or skip actions
+ * Pattern: Explicit decision type with required reasoning
+ */
+export interface ExtractionDecision {
+  readonly action: 'create' | 'update' | 'skip';
+  readonly memo?: ExtractedMemo;
+  readonly updateTarget?: string;
+  readonly updateFields?: Partial<Pick<MemoryEntry, 'title' | 'content' | 'files' | 'tags'>>;
+  readonly reasoning: string;
+}
+
+/**
+ * Memo context for extraction decisions
+ *
+ * ARCHITECTURE: Gradual attention mechanism
+ * Pattern: Long-term has highest weight, today has lowest
+ */
+export interface MemoContext {
+  readonly longTerm: readonly LongTermMemory[];
+  readonly thisWeek: readonly MemoryEntry[];
+  readonly today: readonly MemoryEntry[];
+}
+
+/**
+ * Attention configuration for context loading
+ */
+export interface AttentionConfig {
+  readonly longTermLimit: number;
+  readonly thisWeekLimit: number;
+  readonly todayLimit: number;
 }
 
 // ============================================================================

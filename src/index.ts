@@ -22,6 +22,8 @@ export type {
   PromotionCandidate,
   DaemonConfig,
   DaemonStatus,
+  ProjectStats,
+  GlobalConfig,
   ProxyError,
   DaemonError,
   StorageError,
@@ -63,3 +65,19 @@ export { watchQueue, completeBatch, failBatch } from './daemon/watcher.js';
 export { extractMemories } from './daemon/extractor.js';
 export { runDecay, runDailyDecay, runWeeklyDecay, runMonthlyDecay } from './daemon/decay.js';
 export { evaluateForPromotion, cleanupStaleCandidates } from './daemon/promotion.js';
+
+// Global paths and configuration
+export {
+  getGlobalDir,
+  getGlobalQueueDir,
+  getGlobalConfigPath,
+  getGlobalStatusPath,
+  getProjectMemoryDir,
+  initGlobalDirs,
+  isGlobalInitialized,
+  readGlobalConfig,
+  writeGlobalConfig,
+  initProjectMemory,
+  isProjectMemoryInitialized,
+  isValidProjectPath,
+} from './paths.js';

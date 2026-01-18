@@ -2,32 +2,35 @@
 /**
  * Event Enqueue CLI
  *
- * Called by hook shell scripts to add events to the queue.
- * Reads event data from stdin (JSON) and writes to queue.
+ * Called by hook shell scripts to add events to the global queue.
+ * Reads event data from stdin (JSON) and writes to ~/.devlog/queue.
  *
- * Auto-initializes .memory directory if it doesn't exist.
+ * Auto-initializes global directories if they don't exist.
+ * Includes project_path in events for multi-project routing.
  *
  * Usage:
  *   echo '{"event_type":"tool_use",...}' | node enqueue.js
  *
  * Environment:
- *   MEMORY_DIR - Base directory for .memory (default: current working directory)
+ *   DEVLOG_QUEUE_DIR - Queue directory (default: ~/.devlog/queue)
+ *   PROJECT_PATH - Project path (default: current working directory)
  */
 
 import { enqueueEvent, initQueue } from '../storage/queue.js';
-import { initMemoryStore } from '../storage/memory-store.js';
+import { getGlobalQueueDir, initGlobalDirs, isGlobalInitialized } from '../paths.js';
 import type { EventType } from '../types/index.js';
-import { join } from 'node:path';
-import { promises as fs } from 'node:fs';
+import { resolve } from 'node:path';
 
+/**
+ * Input from Stop hook for turn_complete events
+ */
 interface HookInput {
   readonly session_id?: string;
-  readonly transcript_path?: string;
   readonly event_type: EventType;
-  readonly tool_name?: string;
-  readonly tool_input?: unknown;
-  readonly tool_result?: string;
-  readonly conversation_summary?: string;
+  readonly project_path?: string;
+  readonly user_prompt: string;
+  readonly assistant_response: string;
+  readonly files_touched?: readonly string[];
 }
 
 async function readStdin(): Promise<string> {
@@ -40,55 +43,27 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
-async function autoInit(baseDir: string): Promise<void> {
-  const memoryPath = join(baseDir, '.memory');
-
-  // Check if .memory already exists
-  try {
-    await fs.access(memoryPath);
-    return; // Already initialized
-  } catch {
-    // Directory doesn't exist, initialize it
+async function ensureGlobalInit(): Promise<void> {
+  const initialized = await isGlobalInitialized();
+  if (initialized) {
+    return;
   }
 
-  // Initialize queue directories
-  const queueResult = await initQueue({ baseDir: join(memoryPath, 'queue') });
-  if (!queueResult.ok) {
-    throw new Error(`Failed to initialize queue: ${queueResult.error.message}`);
-  }
-
-  // Initialize memory store directories
-  const storeResult = await initMemoryStore({ baseDir: memoryPath });
-  if (!storeResult.ok) {
-    throw new Error(`Failed to initialize memory store: ${storeResult.error.message}`);
-  }
-
-  // Create initial memory files
-  const today = new Date().toISOString().split('T')[0];
-  const shortDir = join(memoryPath, 'short');
-
-  for (const file of ['today.md', 'this-week.md', 'this-month.md']) {
-    const path = join(shortDir, file);
-    try {
-      await fs.access(path);
-    } catch {
-      await fs.writeFile(path, `---
-date: ${today}
-entries: 0
-last_updated: ${new Date().toISOString()}
----
-# ${file.replace('.md', '').replace(/-/g, ' ')} - ${today}
-`);
-    }
+  const result = await initGlobalDirs();
+  if (!result.ok) {
+    throw new Error(`Failed to initialize global directories: ${result.error.message}`);
   }
 }
 
 async function main(): Promise<void> {
-  const memoryDir = process.env['MEMORY_DIR'] ?? process.cwd();
-  const queueDir = join(memoryDir, '.memory', 'queue');
+  // Use global queue directory
+  const queueDir = getGlobalQueueDir();
 
-  // Auto-initialize if .memory doesn't exist
-  await autoInit(memoryDir);
+  // Get project path from environment or stdin data, default to cwd
+  const projectPath = process.env['PROJECT_PATH'] ?? process.cwd();
+
+  // Auto-initialize global dirs if needed
+  await ensureGlobalInit();
 
   // Ensure queue is initialized (idempotent)
   const initResult = await initQueue({ baseDir: queueDir });
@@ -117,16 +92,23 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Enqueue the event
+  if (!input.user_prompt) {
+    console.error('Missing required field: user_prompt');
+    process.exit(1);
+  }
+
+  // Resolve project path to absolute
+  const resolvedProjectPath = resolve(input.project_path ?? projectPath);
+
+  // Enqueue the turn_complete event
   const result = await enqueueEvent(
     {
       event_type: input.event_type,
       session_id: input.session_id ?? 'unknown',
-      transcript_path: input.transcript_path,
-      tool_name: input.tool_name,
-      tool_input: input.tool_input,
-      tool_result: input.tool_result,
-      conversation_summary: input.conversation_summary,
+      project_path: resolvedProjectPath,
+      user_prompt: input.user_prompt,
+      assistant_response: input.assistant_response ?? '',
+      files_touched: input.files_touched ?? [],
     },
     { baseDir: queueDir }
   );

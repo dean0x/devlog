@@ -63,14 +63,15 @@ function createPatternHash(entry: MemoryEntry): string {
  */
 function suggestCategory(entry: MemoryEntry): LongTermMemory['category'] {
   switch (entry.type) {
-    case 'convention':
-      return 'conventions';
-    case 'pattern':
-      return 'rules_of_thumb';
     case 'decision':
       return entry.tags?.some((t) => t.toLowerCase().includes('arch'))
         ? 'architecture'
         : 'conventions';
+    case 'insight':
+      return 'rules_of_thumb';
+    case 'goal':
+    case 'context':
+    case 'problem':
     default:
       return 'rules_of_thumb';
   }
@@ -101,8 +102,8 @@ export async function evaluateForPromotion(
 
   // Process new memories
   for (const memory of memories) {
-    // Only consider high-value types
-    if (!['decision', 'pattern', 'convention'].includes(memory.type)) {
+    // Only consider high-value types for promotion
+    if (!['decision', 'insight'].includes(memory.type)) {
       continue;
     }
 

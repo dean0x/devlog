@@ -87,20 +87,20 @@ function formatMemoryEntry(entry: MemoryEntry): string {
   let markdown = `## ${time} - ${entry.title}\n\n`;
 
   switch (entry.type) {
+    case 'goal':
+      markdown += `**Goal**: ${entry.content}\n`;
+      break;
     case 'decision':
       markdown += `**Decision**: ${entry.content}\n`;
-      break;
-    case 'pattern':
-      markdown += `**Pattern**: ${entry.content}\n`;
       break;
     case 'problem':
       markdown += `**Problem**: ${entry.content}\n`;
       break;
-    case 'solution':
-      markdown += `**Solution**: ${entry.content}\n`;
+    case 'context':
+      markdown += `**Context**: ${entry.content}\n`;
       break;
-    case 'convention':
-      markdown += `**Convention**: ${entry.content}\n`;
+    case 'insight':
+      markdown += `**Insight**: ${entry.content}\n`;
       break;
   }
 
@@ -270,6 +270,113 @@ export async function appendToShortTermMemory(
   }
 }
 
+/**
+ * Write short-term memory file (full rewrite)
+ *
+ * ARCHITECTURE: Used by updateMemoryEntry for atomic updates
+ * Pattern: Read-modify-write with full file replacement
+ */
+export async function writeShortTermMemory(
+  config: MemoryStoreConfig,
+  period: 'today' | 'this-week' | 'this-month',
+  memories: readonly MemoryEntry[]
+): Promise<Result<void, StorageError>> {
+  const path = getShortTermPath(config, period);
+  const now = new Date();
+
+  let dateHeader: string;
+  switch (period) {
+    case 'today':
+      dateHeader = format(now, 'yyyy-MM-dd');
+      break;
+    case 'this-week':
+      dateHeader = `Week of ${format(startOfWeek(now), 'yyyy-MM-dd')}`;
+      break;
+    case 'this-month':
+      dateHeader = format(startOfMonth(now), 'MMMM yyyy');
+      break;
+  }
+
+  const frontmatter = {
+    date: format(now, 'yyyy-MM-dd'),
+    entries: memories.length,
+    last_updated: now.toISOString(),
+  };
+
+  const content =
+    `# ${period === 'today' ? "Today's Memory" : period === 'this-week' ? 'This Week' : 'This Month'} - ${dateHeader}\n\n` +
+    memories.map(formatMemoryEntry).join('\n');
+
+  const markdown = serializeMarkdownWithFrontmatter({ frontmatter, content });
+
+  try {
+    await fs.mkdir(dirname(path), { recursive: true });
+    await fs.writeFile(path, markdown, 'utf-8');
+    return Ok(undefined);
+  } catch (error) {
+    return Err({
+      type: 'write_error',
+      message: `Failed to write memory file: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      path,
+    });
+  }
+}
+
+/**
+ * Update a specific memory entry by ID
+ *
+ * ARCHITECTURE: Atomic update with immutable pattern
+ * Pattern: Read-modify-write, returns new file state
+ */
+export async function updateMemoryEntry(
+  config: MemoryStoreConfig,
+  period: 'today' | 'this-week' | 'this-month',
+  memoId: string,
+  updates: Partial<Pick<MemoryEntry, 'title' | 'content' | 'files' | 'tags'>>
+): Promise<Result<void, StorageError>> {
+  const readResult = await readShortTermMemory(config, period);
+  if (!readResult.ok) {
+    return Err(readResult.error);
+  }
+
+  const existing = readResult.value.memories;
+  const targetIndex = existing.findIndex((m) => m.id === memoId);
+
+  if (targetIndex === -1) {
+    return Err({
+      type: 'read_error',
+      message: `Memory entry not found: ${memoId}`,
+      path: getShortTermPath(config, period),
+    });
+  }
+
+  const target = existing[targetIndex];
+  if (!target) {
+    return Err({
+      type: 'read_error',
+      message: `Memory entry not found: ${memoId}`,
+      path: getShortTermPath(config, period),
+    });
+  }
+
+  // Immutable update
+  const updated: MemoryEntry = {
+    ...target,
+    ...(updates.title !== undefined && { title: updates.title }),
+    ...(updates.content !== undefined && { content: updates.content }),
+    ...(updates.files !== undefined && { files: updates.files }),
+    ...(updates.tags !== undefined && { tags: updates.tags }),
+  };
+
+  const updatedMemories = [
+    ...existing.slice(0, targetIndex),
+    updated,
+    ...existing.slice(targetIndex + 1),
+  ];
+
+  return writeShortTermMemory(config, period, updatedMemories);
+}
+
 // ============================================================================
 // Long-Term Memory Operations
 // ============================================================================
@@ -410,6 +517,33 @@ export async function appendLongTermMemory(
       path,
     });
   }
+}
+
+/**
+ * Read all long-term memories across all categories
+ *
+ * ARCHITECTURE: Used by context-aware extraction
+ * Pattern: Aggregates all categories, sorted by occurrences (highest weight)
+ */
+export async function readAllLongTermMemories(
+  config: MemoryStoreConfig
+): Promise<Result<LongTermMemory[], StorageError>> {
+  const categories: LongTermMemory['category'][] = ['conventions', 'architecture', 'rules_of_thumb'];
+  const allMemories: LongTermMemory[] = [];
+
+  for (const category of categories) {
+    const result = await readLongTermMemory(config, category);
+    if (!result.ok) {
+      // Don't fail on individual category errors, just skip
+      continue;
+    }
+    allMemories.push(...result.value);
+  }
+
+  // Sort by occurrences (most established patterns first)
+  allMemories.sort((a, b) => b.occurrences - a.occurrences);
+
+  return Ok(allMemories);
 }
 
 // ============================================================================
