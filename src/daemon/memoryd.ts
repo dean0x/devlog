@@ -547,7 +547,15 @@ async function main(): Promise<void> {
     logger.info('Global memory daemon running. Press Ctrl+C to stop.');
     await processEvents(config);
   } catch (error) {
-    logger.error('Daemon error', { error: error instanceof Error ? error.message : String(error) });
+    // Print full stack trace for debugging
+    if (error instanceof Error && error.stack) {
+      console.error('\n=== DAEMON ERROR ===');
+      console.error(error.stack);
+      console.error('====================\n');
+    }
+    logger.error('Daemon error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
     process.exit(1);
   }
 }

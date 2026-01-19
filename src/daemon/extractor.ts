@@ -26,7 +26,7 @@ function debugLog(msg: string, data?: Record<string, unknown>): void {
   let dataStr = '';
   if (data) {
     const pairs = Object.entries(data).map(([k, v]) => {
-      const str = typeof v === 'string' ? v : JSON.stringify(v);
+      const str = v === undefined ? 'undefined' : (typeof v === 'string' ? v : JSON.stringify(v) ?? 'null');
       return `${k}=${str.length > 100 ? str.slice(0, 97) + '...' : str}`;
     });
     dataStr = pairs.length > 0 ? ` (${pairs.join(', ')})` : '';
@@ -171,12 +171,55 @@ function buildExtractionPrompt(event: QueuedEvent): string {
 }
 
 /**
+ * Extract the first complete JSON object from a response string.
+ * Handles models that output <think>...</think> or other text around JSON.
+ */
+function extractJsonFromResponse(response: string): string | null {
+  const startIdx = response.indexOf('{');
+  if (startIdx === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = startIdx; i < response.length; i++) {
+    const char = response[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+
+    if (char === '"' && !escape) {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === '{') depth++;
+      else if (char === '}') {
+        depth--;
+        if (depth === 0) {
+          return response.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Parse the extraction response into a memo (or null)
  */
 function parseExtractionResponse(response: string): Result<ExtractionResult, DaemonError> {
-  // Try to find JSON in the response
-  const jsonMatch = response.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
+  const jsonStr = extractJsonFromResponse(response);
+  if (!jsonStr) {
     return Err({
       type: 'extraction_error',
       message: 'No valid JSON found in extraction response',
@@ -184,7 +227,7 @@ function parseExtractionResponse(response: string): Result<ExtractionResult, Dae
   }
 
   try {
-    const parsed = JSON.parse(jsonMatch[0]) as {
+    const parsed = JSON.parse(jsonStr) as {
       memo?: {
         type?: string;
         title?: string;
@@ -411,7 +454,7 @@ export function memoToMemoryEntry(memo: ExtractedMemo): MemoryEntry {
     title: memo.title,
     content: memo.content,
     confidence: CONFIDENCE_LEVELS[source],
-    files: memo.files.length > 0 ? memo.files : undefined,
+    files: memo.files && memo.files.length > 0 ? memo.files : undefined,
     tags: memo.tags,
     source,
   };
@@ -620,8 +663,8 @@ function buildContextAwarePrompt(event: QueuedEvent, context: MemoContext): stri
 function parseExtractionDecision(
   response: string
 ): Result<ExtractionDecision, DaemonError> {
-  const jsonMatch = response.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
+  const jsonStr = extractJsonFromResponse(response);
+  if (!jsonStr) {
     return Err({
       type: 'extraction_error',
       message: 'No valid JSON found in extraction response',
@@ -629,7 +672,7 @@ function parseExtractionDecision(
   }
 
   try {
-    const parsed = JSON.parse(jsonMatch[0]) as {
+    const parsed = JSON.parse(jsonStr) as {
       action?: string;
       memo?: {
         type?: string;

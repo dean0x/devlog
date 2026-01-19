@@ -557,7 +557,16 @@ export async function readPromotionCandidates(
 
   try {
     const content = await fs.readFile(path, 'utf-8');
-    const candidates = JSON.parse(content) as PromotionCandidate[];
+    const parsed = JSON.parse(content);
+    // Handle both array format and {candidates: []} wrapper format
+    let candidates: PromotionCandidate[];
+    if (Array.isArray(parsed)) {
+      candidates = parsed;
+    } else if (parsed && Array.isArray(parsed.candidates)) {
+      candidates = parsed.candidates;
+    } else {
+      candidates = [];
+    }
     return Ok(candidates);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
