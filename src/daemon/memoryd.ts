@@ -75,15 +75,40 @@ function createLogger(): Logger {
 
 const logger = createLogger();
 import { watchQueue, completeBatch, failBatch, type WatcherConfig } from './watcher.js';
-import { extractMemoWithContext, memoToMemoryEntry, type ExtractorConfig } from './extractor.js';
+import {
+  extractMemoWithContext,
+  memoToMemoryEntry,
+  extractSessionKnowledge,
+  type ExtractorConfig,
+  type SessionConsolidationDecision,
+} from './extractor.js';
 import { runDecay } from './decay.js';
 import { evaluateForPromotion, cleanupStaleCandidates, type PromotionConfig } from './promotion.js';
+import { evaluateGates, shouldProcessSession } from './extraction-gates.js';
 import { initQueue } from '../storage/queue.js';
 import {
   appendToShortTermMemory,
   updateMemoryEntry,
   type MemoryStoreConfig,
 } from '../storage/memory-store.js';
+import {
+  findStaleSessions,
+  finalizeSession,
+  archiveSession,
+  findSessionsToConsolidate,
+  type SessionStoreConfig,
+} from '../storage/session-store.js';
+import {
+  initKnowledgeStore,
+  addSection,
+  updateSection,
+  confirmSection,
+  createSection,
+  updateIndex,
+  readKnowledgeFile,
+  type KnowledgeStoreConfig,
+  type KnowledgeCategory,
+} from '../storage/knowledge-store.js';
 import {
   getGlobalDir,
   getGlobalQueueDir,
@@ -93,8 +118,11 @@ import {
   initProjectMemory,
   isProjectMemoryInitialized,
   readGlobalConfig,
+  readSessionConfig,
 } from '../paths.js';
 import type { DaemonConfig, DaemonStatus, QueuedEvent, ProjectStats } from '../types/index.js';
+import type { SessionConfig, SessionAccumulator } from '../types/session.js';
+import { DEFAULT_SESSION_CONFIG } from '../types/session.js';
 
 // ============================================================================
 // PID File Management
@@ -247,6 +275,297 @@ async function runScheduledDecayForAllProjects(_config: DaemonConfig): Promise<v
   }
 
   state.lastDecay = new Date();
+}
+
+// ============================================================================
+// Session Processing (New System)
+// ============================================================================
+
+/**
+ * Check for stale sessions and trigger consolidation
+ */
+async function checkForStaleSessions(
+  config: DaemonConfig,
+  extractorConfig: ExtractorConfig
+): Promise<void> {
+  // Read session config
+  const sessionConfigResult = await readSessionConfig();
+  const sessionConfig: SessionConfig = sessionConfigResult.ok
+    ? sessionConfigResult.value
+    : DEFAULT_SESSION_CONFIG;
+
+  // Skip if session consolidation is disabled
+  if (!sessionConfig.session_consolidation) {
+    return;
+  }
+
+  // Get all known projects
+  for (const projectPath of state.projects.keys()) {
+    const memoryDir = getProjectMemoryDir(projectPath);
+    const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+
+    // Find stale sessions
+    const staleResult = await findStaleSessions(sessionStoreConfig, sessionConfig.timeout_ms);
+    if (!staleResult.ok) {
+      logger.warn(`Failed to check stale sessions for ${projectPath}`, {
+        error: staleResult.error.message,
+      });
+      continue;
+    }
+
+    // Finalize each stale session
+    for (const session of staleResult.value) {
+      logger.info(`Found stale session ${session.session_id} for ${projectPath}`, {
+        signals: session.signals.length,
+        last_activity: session.last_activity,
+      });
+
+      const finalizeResult = await finalizeSession(sessionStoreConfig, session.session_id);
+      if (!finalizeResult.ok) {
+        logger.warn(`Failed to finalize session ${session.session_id}`, {
+          error: finalizeResult.error.message,
+        });
+      }
+    }
+  }
+
+  // Process all sessions that need consolidation
+  await processSessionConsolidations(config, extractorConfig);
+}
+
+/**
+ * Process sessions that are ready for consolidation
+ */
+async function processSessionConsolidations(
+  _config: DaemonConfig,
+  extractorConfig: ExtractorConfig
+): Promise<void> {
+  for (const projectPath of state.projects.keys()) {
+    const memoryDir = getProjectMemoryDir(projectPath);
+    const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+    const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir };
+
+    // Initialize knowledge store if needed
+    await initKnowledgeStore(knowledgeStoreConfig);
+
+    // Find sessions to consolidate
+    const sessionsResult = await findSessionsToConsolidate(sessionStoreConfig);
+    if (!sessionsResult.ok) {
+      continue;
+    }
+
+    for (const session of sessionsResult.value) {
+      logger.info(`Consolidating session ${session.session_id}`, {
+        project: projectPath,
+        signals: session.signals.length,
+      });
+
+      // Process the session
+      const result = await processSessionConsolidation(
+        session,
+        knowledgeStoreConfig,
+        extractorConfig
+      );
+
+      if (result.success) {
+        // Archive the session
+        await archiveSession(sessionStoreConfig, session.session_id);
+
+        // Update knowledge index if knowledge was modified
+        if (result.knowledgeUpdated) {
+          await updateIndex(knowledgeStoreConfig);
+        }
+
+        logger.info(`Session ${session.session_id} consolidated`, {
+          action: result.action,
+          knowledge_updated: result.knowledgeUpdated,
+        });
+      } else {
+        logger.warn(`Session consolidation failed: ${result.error}`, {
+          session_id: session.session_id,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Process a single session's consolidation
+ */
+async function processSessionConsolidation(
+  session: SessionAccumulator,
+  knowledgeStoreConfig: KnowledgeStoreConfig,
+  extractorConfig: ExtractorConfig
+): Promise<{
+  success: boolean;
+  action?: string;
+  knowledgeUpdated?: boolean;
+  error?: string;
+}> {
+  // Check if session should be processed (quick gate)
+  if (!shouldProcessSession(session)) {
+    return { success: true, action: 'skip_gates', knowledgeUpdated: false };
+  }
+
+  // Run full gate evaluation
+  const gateResult = await evaluateGates(session, knowledgeStoreConfig);
+  if (!gateResult.ok) {
+    return { success: false, error: gateResult.error.message };
+  }
+
+  const gate = gateResult.value;
+  logger.debug('Gate evaluation result', {
+    action: gate.action,
+    reasoning: gate.reasoning,
+    signals_passed: gate.signals_passed,
+  });
+
+  switch (gate.action) {
+    case 'skip':
+      return { success: true, action: 'skip', knowledgeUpdated: false };
+
+    case 'confirm_pattern':
+      // Just bump observation count - no LLM needed
+      if (gate.matchedSection) {
+        const confirmResult = await confirmSection(
+          knowledgeStoreConfig,
+          gate.matchedSection.category,
+          gate.matchedSection.section.id
+        );
+        if (confirmResult.ok) {
+          return { success: true, action: 'confirm_pattern', knowledgeUpdated: true };
+        }
+      }
+      return { success: true, action: 'confirm_pattern', knowledgeUpdated: false };
+
+    case 'consolidate':
+    case 'create_new':
+      // Run LLM extraction
+      const extractResult = await extractSessionKnowledge(
+        session,
+        knowledgeStoreConfig,
+        extractorConfig
+      );
+
+      if (!extractResult.ok) {
+        return { success: false, error: extractResult.error.message };
+      }
+
+      const decision = extractResult.value;
+      return await applyConsolidationDecision(decision, knowledgeStoreConfig);
+  }
+}
+
+/**
+ * Apply a consolidation decision to the knowledge store
+ */
+async function applyConsolidationDecision(
+  decision: SessionConsolidationDecision,
+  knowledgeStoreConfig: KnowledgeStoreConfig
+): Promise<{
+  success: boolean;
+  action: string;
+  knowledgeUpdated: boolean;
+  error?: string;
+}> {
+  switch (decision.action) {
+    case 'skip':
+      return { success: true, action: 'skip', knowledgeUpdated: false };
+
+    case 'create_section':
+      if (!decision.category || !decision.new_section) {
+        return { success: false, action: 'create_section', knowledgeUpdated: false, error: 'Missing category or new_section' };
+      }
+      const newSection = createSection(
+        decision.new_section.title,
+        decision.new_section.content,
+        {
+          tags: decision.new_section.tags,
+          examples: decision.new_section.examples,
+        }
+      );
+      const addResult = await addSection(knowledgeStoreConfig, decision.category, newSection);
+      if (!addResult.ok) {
+        return { success: false, action: 'create_section', knowledgeUpdated: false, error: addResult.error.message };
+      }
+      return { success: true, action: 'create_section', knowledgeUpdated: true };
+
+    case 'extend_section': {
+      if (!decision.category || !decision.section_id || !decision.extension) {
+        return { success: false, action: 'extend_section', knowledgeUpdated: false, error: 'Missing required fields' };
+      }
+      // Read existing section to append content
+      const extendFileResult = await readKnowledgeFile(
+        knowledgeStoreConfig,
+        decision.category as KnowledgeCategory
+      );
+      if (!extendFileResult.ok) {
+        return { success: false, action: 'extend_section', knowledgeUpdated: false, error: extendFileResult.error.message };
+      }
+      const existingSection = extendFileResult.value.sections.find(s => s.id === decision.section_id);
+      const existingContent = existingSection?.content ?? '';
+      const appendedContent = existingContent
+        ? `${existingContent}\n\n${decision.extension.additional_content}`
+        : decision.extension.additional_content;
+
+      const extendResult = await updateSection(
+        knowledgeStoreConfig,
+        decision.category as KnowledgeCategory,
+        decision.section_id,
+        { content: appendedContent }
+      );
+      if (!extendResult.ok) {
+        return { success: false, action: 'extend_section', knowledgeUpdated: false, error: extendResult.error.message };
+      }
+      return { success: true, action: 'extend_section', knowledgeUpdated: true };
+    }
+
+    case 'add_example': {
+      if (!decision.category || !decision.section_id || !decision.extension?.new_examples) {
+        return { success: false, action: 'add_example', knowledgeUpdated: false, error: 'Missing required fields' };
+      }
+      // Read existing section to append examples
+      const exampleFileResult = await readKnowledgeFile(
+        knowledgeStoreConfig,
+        decision.category as KnowledgeCategory
+      );
+      if (!exampleFileResult.ok) {
+        return { success: false, action: 'add_example', knowledgeUpdated: false, error: exampleFileResult.error.message };
+      }
+      const existingSectionForExample = exampleFileResult.value.sections.find(s => s.id === decision.section_id);
+      const existingExamples = existingSectionForExample?.examples ?? [];
+      const combinedExamples = [...existingExamples, ...decision.extension.new_examples];
+
+      const exampleResult = await updateSection(
+        knowledgeStoreConfig,
+        decision.category as KnowledgeCategory,
+        decision.section_id,
+        { examples: combinedExamples }
+      );
+      if (!exampleResult.ok) {
+        return { success: false, action: 'add_example', knowledgeUpdated: false, error: exampleResult.error.message };
+      }
+      return { success: true, action: 'add_example', knowledgeUpdated: true };
+    }
+
+    case 'confirm_pattern':
+      if (decision.category && decision.section_id) {
+        await confirmSection(knowledgeStoreConfig, decision.category, decision.section_id);
+      }
+      return { success: true, action: 'confirm_pattern', knowledgeUpdated: true };
+
+    case 'flag_contradiction':
+      // Log the contradiction but don't automatically resolve
+      logger.warn('Knowledge contradiction flagged', {
+        category: decision.category,
+        section_id: decision.section_id,
+        reasoning: decision.reasoning,
+      });
+      return { success: true, action: 'flag_contradiction', knowledgeUpdated: false };
+
+    default:
+      return { success: true, action: 'unknown', knowledgeUpdated: false };
+  }
 }
 
 // ============================================================================
@@ -411,6 +730,9 @@ async function processEvents(config: DaemonConfig): Promise<void> {
     if (shouldRunDecay(config)) {
       await runScheduledDecayForAllProjects(config);
     }
+
+    // Check for stale sessions (new system)
+    await checkForStaleSessions(config, extractorConfig);
 
     if (!batchResult.ok) {
       logger.error('Queue error', { error: batchResult.error.message });

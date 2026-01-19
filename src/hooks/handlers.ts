@@ -11,8 +11,22 @@
 import { promises as fs, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { enqueueEvent, initQueue } from '../storage/queue.js';
-import { getGlobalQueueDir, initGlobalDirs, isGlobalInitialized } from '../paths.js';
+import {
+  initSessionStore,
+  appendSignalAndPersist,
+  extractSignalsFromTurn,
+  type SessionStoreConfig,
+} from '../storage/session-store.js';
+import {
+  getGlobalQueueDir,
+  getProjectMemoryDir,
+  initGlobalDirs,
+  isGlobalInitialized,
+} from '../paths.js';
+import { readSessionConfig } from '../paths.js';
 import type { Result } from '../types/index.js';
+import type { SessionConfig } from '../types/session.js';
+import { DEFAULT_SESSION_CONFIG } from '../types/session.js';
 
 // ============================================================================
 // Extraction Detection - Prevents hook feedback loop
@@ -235,8 +249,9 @@ export async function handlePostToolUse(): Promise<Result<void, Error>> {
 /**
  * Handle Stop hook - extract memo from turn
  *
- * Reads transcript, gets files from buffer, queues turn_complete event,
- * and clears the buffer.
+ * Reads transcript, gets files from buffer, and either:
+ * - (legacy) Queues turn_complete event for per-turn extraction
+ * - (new) Accumulates signals to session buffer for consolidation
  *
  * Environment:
  *   CLAUDE_SESSION_ID - Session identifier
@@ -307,38 +322,91 @@ export async function handleStop(): Promise<Result<void, Error>> {
     // Auto-initialize global dirs if needed
     await ensureGlobalInit();
 
-    // Initialize queue
-    const queueDir = getGlobalQueueDir();
-    const initResult = await initQueue({ baseDir: queueDir });
-    if (!initResult.ok) {
-      return {
-        ok: false,
-        error: new Error(`Failed to initialize queue: ${initResult.error.message}`),
-      };
+    // Read session config to determine processing mode
+    const configResult = await readSessionConfig();
+    const sessionConfig: SessionConfig = configResult.ok
+      ? configResult.value
+      : DEFAULT_SESSION_CONFIG;
+
+    // Process based on enabled modes
+    const results: string[] = [];
+
+    // New session-based accumulation (if enabled)
+    if (sessionConfig.session_consolidation) {
+      const memoryDir = getProjectMemoryDir(resolve(projectPath));
+      const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+
+      // Initialize session store
+      await initSessionStore(sessionStoreConfig);
+
+      // Get turn number from session (we estimate based on signal count)
+      // In practice, this is incremented each time we add signals
+      const turnNumber = Date.now(); // Use timestamp as unique turn identifier
+
+      // Extract signals from turn
+      const signals = extractSignalsFromTurn(
+        turnNumber,
+        turnData.user_prompt,
+        turnData.assistant_response,
+        filesTouched
+      );
+
+      // Append signals to session buffer
+      for (const signal of signals) {
+        const appendResult = await appendSignalAndPersist(
+          sessionStoreConfig,
+          sessionId,
+          resolve(projectPath),
+          signal
+        );
+
+        if (!appendResult.ok) {
+          console.warn(`Failed to append signal: ${appendResult.error.message}`);
+        }
+      }
+
+      results.push(`Accumulated ${signals.length} signals`);
     }
 
-    // Enqueue turn_complete event
-    const result = await enqueueEvent(
-      {
-        event_type: 'turn_complete',
-        session_id: sessionId,
-        project_path: resolve(projectPath),
-        user_prompt: turnData.user_prompt,
-        assistant_response: turnData.assistant_response,
-        files_touched: filesTouched,
-      },
-      { baseDir: queueDir }
-    );
+    // Legacy per-turn processing (if enabled)
+    if (sessionConfig.legacy_turn_processing) {
+      // Initialize queue
+      const queueDir = getGlobalQueueDir();
+      const initResult = await initQueue({ baseDir: queueDir });
+      if (!initResult.ok) {
+        return {
+          ok: false,
+          error: new Error(`Failed to initialize queue: ${initResult.error.message}`),
+        };
+      }
 
-    if (!result.ok) {
-      return {
-        ok: false,
-        error: new Error(`Failed to enqueue event: ${result.error.message}`),
-      };
+      // Enqueue turn_complete event
+      const result = await enqueueEvent(
+        {
+          event_type: 'turn_complete',
+          session_id: sessionId,
+          project_path: resolve(projectPath),
+          user_prompt: turnData.user_prompt,
+          assistant_response: turnData.assistant_response,
+          files_touched: filesTouched,
+        },
+        { baseDir: queueDir }
+      );
+
+      if (!result.ok) {
+        return {
+          ok: false,
+          error: new Error(`Failed to enqueue event: ${result.error.message}`),
+        };
+      }
+
+      results.push(`Enqueued event: ${result.value}`);
     }
 
     // Log success (visible in Claude Code hook output)
-    console.log(`Enqueued event: ${result.value}`);
+    if (results.length > 0) {
+      console.log(results.join(', '));
+    }
 
     return { ok: true, value: undefined };
   } catch (error) {

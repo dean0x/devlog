@@ -227,3 +227,24 @@ export type StorageError =
   | { readonly type: 'read_error'; readonly message: string; readonly path: string }
   | { readonly type: 'write_error'; readonly message: string; readonly path: string }
   | { readonly type: 'parse_error'; readonly message: string; readonly path: string };
+
+// ============================================================================
+// Re-exports for convenience
+// ============================================================================
+
+// Re-export session types
+export type {
+  SignalType,
+  SessionSignal,
+  SessionStatus,
+  SessionAccumulator,
+  SessionEventType,
+  SessionTurnEvent,
+  SessionEndEvent,
+  ConsolidationAction,
+  ConsolidationResult,
+  ConsolidationActionTaken,
+  SessionConfig,
+} from './session.js';
+
+export { DEFAULT_SESSION_CONFIG } from './session.js';

@@ -23,6 +23,8 @@ import { homedir } from 'node:os';
 import { promises as fs } from 'node:fs';
 import type { GlobalConfig, Result, StorageError } from './types/index.js';
 import { Ok, Err } from './types/index.js';
+import type { SessionConfig } from './types/session.js';
+import { DEFAULT_SESSION_CONFIG } from './types/session.js';
 
 // ============================================================================
 // Global Paths (setup once, works everywhere)
@@ -246,5 +248,72 @@ export async function isProjectMemoryInitialized(projectPath: string): Promise<b
     return true;
   } catch {
     return false;
+  }
+}
+
+// ============================================================================
+// Session Configuration
+// ============================================================================
+
+/**
+ * Read session configuration from global config
+ */
+export async function readSessionConfig(): Promise<Result<SessionConfig, StorageError>> {
+  const configPath = getGlobalConfigPath();
+
+  try {
+    const content = await fs.readFile(configPath, 'utf-8');
+    const config = JSON.parse(content) as { session?: Partial<SessionConfig> };
+    return Ok({
+      ...DEFAULT_SESSION_CONFIG,
+      ...(config.session ?? {}),
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return Ok(DEFAULT_SESSION_CONFIG);
+    }
+    return Err({
+      type: 'read_error',
+      message: `Failed to read session config: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      path: configPath,
+    });
+  }
+}
+
+/**
+ * Write session configuration to global config
+ */
+export async function writeSessionConfig(
+  sessionConfig: Partial<SessionConfig>
+): Promise<Result<void, StorageError>> {
+  const configPath = getGlobalConfigPath();
+
+  try {
+    // Read existing config
+    let existing: Record<string, unknown> = {};
+    try {
+      const content = await fs.readFile(configPath, 'utf-8');
+      existing = JSON.parse(content) as Record<string, unknown>;
+    } catch {
+      // File doesn't exist or is invalid, start fresh
+    }
+
+    // Merge session config
+    const updated = {
+      ...existing,
+      session: {
+        ...(existing['session'] as object ?? {}),
+        ...sessionConfig,
+      },
+    };
+
+    await fs.writeFile(configPath, JSON.stringify(updated, null, 2), 'utf-8');
+    return Ok(undefined);
+  } catch (error) {
+    return Err({
+      type: 'write_error',
+      message: `Failed to write session config: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      path: configPath,
+    });
   }
 }

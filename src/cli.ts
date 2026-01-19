@@ -21,6 +21,20 @@ import { createInterface } from 'node:readline';
 import { readShortTermMemory } from './storage/memory-store.js';
 import { getQueueStats } from './storage/queue.js';
 import {
+  readKnowledgeFile,
+  searchKnowledge,
+  getAllCategories,
+  getCategoryTitle,
+  updateIndex,
+  type KnowledgeCategory,
+  type KnowledgeStoreConfig,
+} from './storage/knowledge-store.js';
+import {
+  listSessions,
+  finalizeSession,
+  type SessionStoreConfig,
+} from './storage/session-store.js';
+import {
   getGlobalDir,
   getGlobalQueueDir,
   getGlobalStatusPath,
@@ -30,6 +44,7 @@ import {
   isGlobalInitialized,
   readGlobalConfig,
   writeGlobalConfig,
+  writeSessionConfig,
 } from './paths.js';
 import { handlePostToolUse, handleStop } from './hooks/handlers.js';
 import type { DaemonStatus } from './types/index.js';
@@ -495,6 +510,195 @@ async function showConfig(): Promise<void> {
   console.log(JSON.stringify(result.value, null, 2));
 }
 
+// ============================================================================
+// Knowledge Commands (New System)
+// ============================================================================
+
+async function consolidate(): Promise<void> {
+  const memoryDir = getProjectMemoryDir(process.cwd());
+  const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+
+  console.log('Triggering session consolidation...\n');
+
+  // List all active sessions
+  const listResult = await listSessions(sessionStoreConfig);
+  if (!listResult.ok) {
+    console.error(`Failed to list sessions: ${listResult.error.message}`);
+    return;
+  }
+
+  if (listResult.value.length === 0) {
+    console.log('No active sessions found for this project.');
+    console.log('\nSessions are automatically created when you use Claude Code with devlog hooks.');
+    return;
+  }
+
+  console.log(`Found ${listResult.value.length} session(s):\n`);
+
+  let finalized = 0;
+  for (const sessionId of listResult.value) {
+    console.log(`  - ${sessionId}`);
+
+    // Finalize the session (mark for consolidation)
+    const finalizeResult = await finalizeSession(sessionStoreConfig, sessionId);
+    if (finalizeResult.ok) {
+      finalized++;
+    }
+  }
+
+  console.log(`\nFinalized ${finalized} session(s) for consolidation.`);
+  console.log('The daemon will process them on its next cycle.');
+  console.log('\nTo see results, run:');
+  console.log('  devlog knowledge');
+}
+
+async function showKnowledge(category?: string): Promise<void> {
+  const memoryDir = getProjectMemoryDir(process.cwd());
+  const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir };
+
+  if (category) {
+    // Show specific category
+    const validCategories = getAllCategories();
+    if (!validCategories.includes(category as KnowledgeCategory)) {
+      console.error(`Invalid category: ${category}`);
+      console.log(`Valid categories: ${validCategories.join(', ')}`);
+      return;
+    }
+
+    const result = await readKnowledgeFile(knowledgeStoreConfig, category as KnowledgeCategory);
+    if (!result.ok) {
+      console.error(`Failed to read knowledge: ${result.error.message}`);
+      return;
+    }
+
+    const file = result.value;
+    console.log(`\n=== ${getCategoryTitle(category as KnowledgeCategory).toUpperCase()} ===\n`);
+
+    if (file.sections.length === 0) {
+      console.log('No knowledge sections yet in this category.');
+      console.log('\nKnowledge is automatically created from your Claude Code sessions.');
+      return;
+    }
+
+    for (const section of file.sections) {
+      console.log(`[${section.id}] ${section.title}`);
+      console.log(`  ${section.content.slice(0, 200)}${section.content.length > 200 ? '...' : ''}`);
+      console.log(`  Confidence: ${section.confidence} | Observations: ${section.observations}`);
+      if (section.related_files && section.related_files.length > 0) {
+        console.log(`  Files: ${section.related_files.slice(0, 3).join(', ')}`);
+      }
+      console.log();
+    }
+  } else {
+    // Show summary of all categories
+    console.log('\n=== PROJECT KNOWLEDGE ===\n');
+
+    const categories = getAllCategories();
+    let totalSections = 0;
+
+    for (const cat of categories) {
+      const result = await readKnowledgeFile(knowledgeStoreConfig, cat);
+      if (!result.ok) continue;
+
+      const file = result.value;
+      const title = getCategoryTitle(cat);
+
+      console.log(`${title}: ${file.sections.length} section(s)`);
+      totalSections += file.sections.length;
+
+      // Show top 3 by observations
+      const topSections = [...file.sections]
+        .sort((a, b) => b.observations - a.observations)
+        .slice(0, 3);
+
+      for (const section of topSections) {
+        console.log(`  - [${section.id}] ${section.title} (${section.confidence})`);
+      }
+
+      if (file.sections.length > 3) {
+        console.log(`  ... and ${file.sections.length - 3} more`);
+      }
+      console.log();
+    }
+
+    if (totalSections === 0) {
+      console.log('No knowledge yet. Knowledge is created from your Claude Code sessions.\n');
+      console.log('To enable session consolidation, run:');
+      console.log('  devlog feature:enable session_consolidation\n');
+    } else {
+      console.log(`Total: ${totalSections} knowledge sections\n`);
+      console.log('To view a specific category:');
+      console.log('  devlog knowledge <category>');
+      console.log(`\nCategories: ${categories.join(', ')}`);
+    }
+
+    // Update index
+    await updateIndex(knowledgeStoreConfig);
+  }
+}
+
+async function searchKnowledgeCommand(query: string): Promise<void> {
+  if (!query) {
+    console.error('Usage: devlog search <query>');
+    return;
+  }
+
+  const memoryDir = getProjectMemoryDir(process.cwd());
+  const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir };
+
+  console.log(`\nSearching for "${query}"...\n`);
+
+  const result = await searchKnowledge(knowledgeStoreConfig, query);
+  if (!result.ok) {
+    console.error(`Search failed: ${result.error.message}`);
+    return;
+  }
+
+  if (result.value.length === 0) {
+    console.log('No matches found.');
+    return;
+  }
+
+  console.log(`Found ${result.value.length} match(es):\n`);
+
+  for (const match of result.value) {
+    console.log(`[${match.category}/${match.section.id}] ${match.section.title}`);
+    console.log(`  ${match.section.content.slice(0, 150)}...`);
+    console.log(`  Confidence: ${match.section.confidence} | Observations: ${match.section.observations}`);
+    console.log();
+  }
+}
+
+async function toggleFeature(feature: string, enable: boolean): Promise<void> {
+  if (feature === 'session_consolidation') {
+    const result = await writeSessionConfig({ session_consolidation: enable });
+    if (result.ok) {
+      console.log(`Session consolidation ${enable ? 'enabled' : 'disabled'}.`);
+      if (enable) {
+        console.log('\nThe new session-based system will now:');
+        console.log('  - Accumulate signals during Claude Code sessions');
+        console.log('  - Consolidate knowledge at session end (5 min timeout)');
+        console.log('  - Store knowledge in .memory/knowledge/ files');
+        console.log('\nNote: Legacy per-turn processing is still active for backward compatibility.');
+      }
+    } else {
+      console.error(`Failed to update config: ${result.error.message}`);
+    }
+  } else if (feature === 'legacy_turn_processing') {
+    const result = await writeSessionConfig({ legacy_turn_processing: enable });
+    if (result.ok) {
+      console.log(`Legacy turn processing ${enable ? 'enabled' : 'disabled'}.`);
+    } else {
+      console.error(`Failed to update config: ${result.error.message}`);
+    }
+  } else {
+    console.error(`Unknown feature: ${feature}`);
+    console.log('\nAvailable features:');
+    console.log('  session_consolidation   - New session-based knowledge consolidation');
+    console.log('  legacy_turn_processing  - Original per-turn memo extraction');
+  }
+}
+
 function printUsage(): void {
   console.log(`
 Devlog - Background memory extraction for Claude Code
@@ -513,6 +717,19 @@ Commands:
   hooks                Print hook configuration for ~/.claude/settings.json
   read [period]        Read memories (today, this-week, this-month)
   config               Show current configuration
+
+Knowledge Commands (new session-based system):
+  consolidate          Force consolidation of active sessions
+  knowledge [category] View knowledge files (conventions, architecture, decisions, gotchas)
+  search <query>       Search across all knowledge
+
+Feature Flags:
+  feature:enable <feature>   Enable a feature
+  feature:disable <feature>  Disable a feature
+
+  Features:
+    session_consolidation   - New session-based knowledge system
+    legacy_turn_processing  - Original per-turn memo extraction
 
 Hook Commands (internal, called by Claude Code):
   hook:post-tool-use  Handle PostToolUse events (file tracking)
@@ -536,6 +753,10 @@ Quick Start:
 
   # View this project's memories
   devlog read today
+
+  # Enable new session-based knowledge system
+  devlog feature:enable session_consolidation
+  devlog knowledge
 `);
 }
 
@@ -593,6 +814,28 @@ switch (command) {
 
   case 'config':
     showConfig();
+    break;
+
+  // Knowledge commands (new session-based system)
+  case 'consolidate':
+    consolidate();
+    break;
+
+  case 'knowledge':
+    showKnowledge(process.argv[3]);
+    break;
+
+  case 'search':
+    searchKnowledgeCommand(process.argv.slice(3).join(' '));
+    break;
+
+  // Feature flag commands
+  case 'feature:enable':
+    toggleFeature(process.argv[3] ?? '', true);
+    break;
+
+  case 'feature:disable':
+    toggleFeature(process.argv[3] ?? '', false);
     break;
 
   // Hook commands (called by Claude Code, not user-facing)
