@@ -142,7 +142,6 @@ export async function isGlobalInitialized(): Promise<boolean> {
 const DEFAULT_CONFIG: GlobalConfig = {
   ollama_base_url: 'http://localhost:11434',
   ollama_model: 'llama3.2',
-  proxy_port: 8082,
 };
 
 /**

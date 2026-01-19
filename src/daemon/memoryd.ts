@@ -113,11 +113,10 @@ async function loadConfig(): Promise<DaemonConfig> {
   const config = globalConfig.ok ? globalConfig.value : {
     ollama_base_url: 'http://localhost:11434',
     ollama_model: 'llama3.2',
-    proxy_port: 8082,
   };
 
   return {
-    proxy_url: process.env['PROXY_URL'] ?? `http://localhost:${config.proxy_port}`,
+    ollama_url: process.env['OLLAMA_BASE_URL'] ?? config.ollama_base_url,
     ollama_model: process.env['OLLAMA_MODEL'] ?? config.ollama_model,
     memory_dir: getGlobalDir(), // Used for global status
     queue_dir: getGlobalQueueDir(),
@@ -396,7 +395,8 @@ async function processEvents(config: DaemonConfig): Promise<void> {
   };
 
   const extractorConfig: ExtractorConfig = {
-    proxyUrl: config.proxy_url,
+    ollamaUrl: config.ollama_url,
+    model: config.ollama_model,
     timeout: 60000,
   };
 
@@ -477,7 +477,8 @@ async function startup(config: DaemonConfig): Promise<void> {
   logger.info('Initializing global memory daemon...');
   logger.info(`Global dir: ${getGlobalDir()}`);
   logger.info(`Queue dir: ${config.queue_dir}`);
-  logger.info(`Proxy URL: ${config.proxy_url}`);
+  logger.info(`Ollama URL: ${config.ollama_url}`);
+  logger.info(`Ollama model: ${config.ollama_model}`);
   logger.debug('Config details', { batch_size: config.batch_size, poll_interval: config.poll_interval_ms });
   if (logger.isDebug()) {
     logger.info('Debug mode enabled - verbose logging active');

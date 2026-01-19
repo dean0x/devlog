@@ -25,119 +25,6 @@ export const Ok = <T>(value: T): Ok<T> => ({ ok: true, value });
 export const Err = <E>(error: E): Err<E> => ({ ok: false, error });
 
 // ============================================================================
-// Anthropic API Types
-// ============================================================================
-
-export interface AnthropicMessage {
-  readonly role: 'user' | 'assistant';
-  readonly content: string | AnthropicContentBlock[];
-}
-
-export interface AnthropicContentBlock {
-  readonly type: 'text' | 'tool_use' | 'tool_result';
-  readonly text?: string;
-  readonly id?: string;
-  readonly name?: string;
-  readonly input?: unknown;
-  readonly tool_use_id?: string;
-  readonly content?: string;
-}
-
-/**
- * System content block for array-format system prompts
- * Used by Claude Code for cache control hints
- */
-export interface SystemContentBlock {
-  readonly type: 'text';
-  readonly text: string;
-  readonly cache_control?: { readonly type: string };
-}
-
-export interface AnthropicRequest {
-  readonly model: string;
-  readonly messages: readonly AnthropicMessage[];
-  readonly max_tokens: number;
-  readonly system?: string | readonly SystemContentBlock[];
-  readonly stream?: boolean;
-  readonly temperature?: number;
-  readonly stop_sequences?: readonly string[];
-}
-
-export interface AnthropicResponse {
-  readonly id: string;
-  readonly type: 'message';
-  readonly role: 'assistant';
-  readonly content: AnthropicContentBlock[];
-  readonly model: string;
-  readonly stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | null;
-  readonly stop_sequence: string | null;
-  readonly usage: {
-    readonly input_tokens: number;
-    readonly output_tokens: number;
-  };
-}
-
-export interface AnthropicStreamEvent {
-  readonly type: 'message_start' | 'content_block_start' | 'content_block_delta' | 'content_block_stop' | 'message_delta' | 'message_stop' | 'ping' | 'error';
-  readonly message?: Partial<AnthropicResponse>;
-  readonly index?: number;
-  readonly content_block?: AnthropicContentBlock;
-  readonly delta?: {
-    readonly type?: string;
-    readonly text?: string;
-    readonly stop_reason?: string;
-    readonly stop_sequence?: string | null;
-  };
-  readonly usage?: {
-    readonly output_tokens: number;
-  };
-  readonly error?: {
-    readonly type: string;
-    readonly message: string;
-  };
-}
-
-// ============================================================================
-// Ollama API Types
-// ============================================================================
-
-export interface OllamaMessage {
-  readonly role: 'user' | 'assistant' | 'system';
-  readonly content: string;
-}
-
-export interface OllamaRequest {
-  readonly model: string;
-  readonly messages: readonly OllamaMessage[];
-  readonly stream?: boolean;
-  readonly options?: {
-    readonly temperature?: number;
-    readonly num_predict?: number;
-    readonly stop?: readonly string[];
-  };
-}
-
-export interface OllamaResponse {
-  readonly model: string;
-  readonly created_at: string;
-  readonly message: OllamaMessage;
-  readonly done: boolean;
-  readonly total_duration?: number;
-  readonly load_duration?: number;
-  readonly prompt_eval_count?: number;
-  readonly prompt_eval_duration?: number;
-  readonly eval_count?: number;
-  readonly eval_duration?: number;
-}
-
-export interface OllamaStreamChunk {
-  readonly model: string;
-  readonly created_at: string;
-  readonly message: OllamaMessage;
-  readonly done: boolean;
-}
-
-// ============================================================================
 // Event Queue Types
 // ============================================================================
 
@@ -228,7 +115,7 @@ export interface PromotionCandidate {
 // ============================================================================
 
 export interface DaemonConfig {
-  readonly proxy_url: string;
+  readonly ollama_url: string;
   readonly ollama_model: string;
   readonly memory_dir: string;
   readonly queue_dir: string;
@@ -262,7 +149,6 @@ export interface ProjectStats {
 export interface GlobalConfig {
   readonly ollama_base_url: string;
   readonly ollama_model: string;
-  readonly proxy_port: number;
 }
 
 // ============================================================================
@@ -271,8 +157,8 @@ export interface GlobalConfig {
 
 /**
  * Source of extracted memo
- * - 'claude': Extracted using Claude via proxy (higher confidence)
- * - 'fallback': Extracted using heuristics when Claude unavailable (lower confidence)
+ * - 'claude': Extracted using Ollama (higher confidence)
+ * - 'fallback': Extracted using heuristics when Ollama unavailable (lower confidence)
  */
 export type MemoSource = 'claude' | 'fallback';
 
@@ -330,12 +216,6 @@ export interface AttentionConfig {
 // ============================================================================
 // Error Types
 // ============================================================================
-
-export type ProxyError =
-  | { readonly type: 'connection_failed'; readonly message: string }
-  | { readonly type: 'invalid_request'; readonly message: string }
-  | { readonly type: 'ollama_error'; readonly message: string; readonly status?: number }
-  | { readonly type: 'translation_error'; readonly message: string };
 
 export type DaemonError =
   | { readonly type: 'queue_error'; readonly message: string }

@@ -1,20 +1,19 @@
 /**
  * Memory Extractor
  *
- * ARCHITECTURE: Spawns Claude Code in headless mode to extract concise memos
+ * ARCHITECTURE: Direct ollama-js calls for memo extraction
  * Pattern: Uses prompt engineering to get structured JSON output
  *
  * The extractor:
  * 1. Takes a single turn event (user prompt + assistant response + files)
  * 2. Loads existing memo context (gradual attention mechanism)
- * 3. Acquires extraction lock (only one Claude instance at a time)
+ * 3. Acquires extraction lock (only one Ollama call at a time)
  * 4. Builds context-aware extraction prompt
- * 5. Spawns `claude -p` with ANTHROPIC_BASE_URL pointing to proxy
+ * 5. Calls Ollama directly via ollama-js
  * 6. Parses decision JSON (create, update, or skip)
  */
 
-import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { Ollama } from 'ollama';
 
 // ============================================================================
 // Debug Logging
@@ -57,8 +56,9 @@ import {
 } from '../storage/memory-store.js';
 
 export interface ExtractorConfig {
-  readonly proxyUrl: string;
-  readonly timeout: number;
+  readonly ollamaUrl: string;
+  readonly model: string;
+  readonly timeout?: number;
 }
 
 // ============================================================================
@@ -77,21 +77,7 @@ const CONTENT_LIMITS = {
 } as const;
 
 // ============================================================================
-// Extraction Marker File - Prevents hook feedback loop
-// ============================================================================
-
-/**
- * ARCHITECTURE: Marker file to signal extraction is in progress
- *
- * Environment variables cannot cross the Claude Code → hook subprocess boundary.
- * Claude Code spawns hooks as separate subprocesses with clean environments.
- * Using a marker file allows hooks to detect when they're being triggered
- * by daemon extraction vs normal Claude Code usage.
- */
-export const EXTRACTION_MARKER = '/tmp/devlog-extraction-active';
-
-// ============================================================================
-// Extraction Lock - Ensures only one Claude instance at a time
+// Extraction Lock - Ensures only one Ollama call at a time
 // ============================================================================
 
 /**
@@ -254,74 +240,59 @@ function parseExtractionResponse(response: string): Result<ExtractionResult, Dae
 }
 
 /**
- * Run Claude Code in headless mode for extraction
+ * Run Ollama extraction directly
  *
- * ARCHITECTURE: Uses marker file to prevent hook feedback loop
- * Pattern: Write marker before spawn, remove after completion
+ * ARCHITECTURE: Direct ollama-js call - no subprocess, no proxy
+ * Pattern: Simple prompt-in, text-out for extraction
  *
- * The marker file signals to hooks that an extraction is in progress,
- * so they should skip their normal behavior to avoid infinite loops.
+ * Benefits:
+ * - No subprocess spawning (faster startup)
+ * - No HTTP translation layer (simpler)
+ * - Direct API calls (debuggable)
+ * - All in one process (traceable)
+ * - No marker file needed (no hooks triggered)
  */
-async function runClaudeExtraction(
+async function runOllamaExtraction(
   prompt: string,
   config: ExtractorConfig
 ): Promise<Result<string, DaemonError>> {
-  debugLog('Starting Claude extraction', { proxy_url: config.proxyUrl, prompt_length: prompt.length });
-
-  // Create marker file before spawning to signal extraction in progress
-  await fs.writeFile(EXTRACTION_MARKER, process.pid.toString());
+  debugLog('Starting Ollama extraction', {
+    host: config.ollamaUrl,
+    model: config.model,
+    prompt_length: prompt.length,
+  });
 
   try {
-    return await new Promise((resolve) => {
-      const env = {
-        ...process.env,
-        ANTHROPIC_BASE_URL: config.proxyUrl,
-      };
+    const ollama = new Ollama({ host: config.ollamaUrl });
 
-      debugLog('Spawning claude -p command');
-      const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: config.timeout,
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      child.stdout.on('data', (data: Buffer) => {
-        stdout += data.toString();
-      });
-
-      child.stderr.on('data', (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      child.on('close', (code) => {
-        if (code !== 0) {
-          debugLog('Claude extraction failed', { exit_code: code, stderr });
-          resolve(Err({
-            type: 'extraction_error',
-            message: `Claude exited with code ${code}: ${stderr}`,
-          }));
-          return;
-        }
-
-        debugLog('Claude extraction succeeded', { response_length: stdout.length });
-        resolve(Ok(stdout));
-      });
-
-      child.on('error', (error) => {
-        debugLog('Failed to spawn Claude', { error: error.message });
-        resolve(Err({
-          type: 'extraction_error',
-          message: `Failed to spawn Claude: ${error.message}`,
-        }));
-      });
+    const response = await ollama.generate({
+      model: config.model,
+      prompt,
+      stream: false,
+      options: {
+        // Low temperature for consistent JSON output
+        temperature: 0.3,
+        // Enough tokens for memo extraction
+        num_predict: 2048,
+      },
     });
-  } finally {
-    // Remove marker after extraction completes (success or failure)
-    await fs.unlink(EXTRACTION_MARKER).catch(() => {
-      // Ignore errors - marker may not exist if write failed
+
+    debugLog('Ollama extraction succeeded', {
+      response_length: response.response.length,
+      eval_count: response.eval_count,
+      total_duration_ms: response.total_duration
+        ? Math.round(response.total_duration / 1_000_000)
+        : undefined,
+    });
+
+    return Ok(response.response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    debugLog('Ollama extraction failed', { error: message });
+
+    return Err({
+      type: 'extraction_error',
+      message: `Ollama extraction failed: ${message}`,
     });
   }
 }
@@ -453,18 +424,18 @@ export async function extractMemo(
   event: QueuedEvent,
   config: ExtractorConfig
 ): Promise<Result<ExtractionResult, DaemonError>> {
-  // Try Claude extraction first
+  // Try Ollama extraction first
   const prompt = buildExtractionPrompt(event);
-  const claudeResult = await runClaudeExtraction(prompt, config);
+  const ollamaResult = await runOllamaExtraction(prompt, config);
 
-  if (claudeResult.ok) {
-    const parseResult = parseExtractionResponse(claudeResult.value);
+  if (ollamaResult.ok) {
+    const parseResult = parseExtractionResponse(ollamaResult.value);
     if (parseResult.ok) {
       return parseResult;
     }
-    console.warn('Failed to parse Claude response, using fallback:', parseResult.error.message);
+    console.warn('Failed to parse Ollama response, using fallback:', parseResult.error.message);
   } else {
-    console.warn('Claude extraction failed, using fallback:', claudeResult.error.message);
+    console.warn('Ollama extraction failed, using fallback:', ollamaResult.error.message);
   }
 
   // Fallback to simple heuristic extraction
@@ -788,7 +759,7 @@ function fallbackDecision(event: QueuedEvent): ExtractionDecision {
   return {
     action: 'create',
     memo: legacyResult.memo,
-    reasoning: 'Fallback: Claude extraction unavailable',
+    reasoning: 'Fallback: Ollama extraction unavailable',
   };
 }
 
@@ -796,7 +767,7 @@ function fallbackDecision(event: QueuedEvent): ExtractionDecision {
  * Extract a memo with context awareness
  *
  * ARCHITECTURE: Main entry point for context-aware extraction
- * Pattern: Loads context, acquires lock, runs Claude, applies decision
+ * Pattern: Loads context, acquires lock, runs Ollama, applies decision
  */
 export async function extractMemoWithContext(
   event: QueuedEvent,
@@ -821,13 +792,13 @@ export async function extractMemoWithContext(
     // 2. Build context-aware prompt
     const prompt = buildContextAwarePrompt(event, context);
 
-    // 3. Run Claude extraction
-    const claudeResult = await runClaudeExtraction(prompt, config);
-    if (!claudeResult.ok) {
-      debugLog('Claude extraction failed, using fallback', { error: claudeResult.error.message });
+    // 3. Run Ollama extraction
+    const ollamaResult = await runOllamaExtraction(prompt, config);
+    if (!ollamaResult.ok) {
+      debugLog('Ollama extraction failed, using fallback', { error: ollamaResult.error.message });
       console.warn(
-        'Claude extraction failed, using fallback:',
-        claudeResult.error.message
+        'Ollama extraction failed, using fallback:',
+        ollamaResult.error.message
       );
       const decision = fallbackDecision(event);
       debugLog('Fallback decision', { action: decision.action, reasoning: decision.reasoning });
@@ -835,8 +806,8 @@ export async function extractMemoWithContext(
     }
 
     // 4. Parse decision
-    debugLog('Parsing Claude response', { response_length: claudeResult.value.length });
-    const decisionResult = parseExtractionDecision(claudeResult.value);
+    debugLog('Parsing Ollama response', { response_length: ollamaResult.value.length });
+    const decisionResult = parseExtractionDecision(ollamaResult.value);
     if (!decisionResult.ok) {
       debugLog('Failed to parse decision, using fallback', { error: decisionResult.error.message });
       console.warn(

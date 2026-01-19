@@ -9,9 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "proxy": "node dist/proxy/server.js",
     "daemon": "node dist/daemon/memoryd.js",
-    "dev:proxy": "tsx watch src/proxy/server.ts",
     "dev:daemon": "tsx watch src/daemon/memoryd.ts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -19,14 +17,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "ollama": "^0.5.11",
     "chokidar": "^3.6.0",
     "uuid": "^10.0.0",
     "yaml": "^2.5.0",
     "date-fns": "^3.6.0"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
     "@types/uuid": "^10.0.0",
     "tsx": "^4.19.0",

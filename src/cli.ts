@@ -5,9 +5,8 @@
  * Global daemon architecture - setup once, works everywhere.
  *
  * Usage:
- *   devlog setup         - Full setup (init + hooks + start services)
+ *   devlog setup         - Full setup (init + hooks + start daemon)
  *   devlog init          - Initialize global ~/.devlog directory only
- *   devlog proxy         - Start the Anthropic-to-Ollama proxy
  *   devlog daemon        - Start the global memory daemon
  *   devlog status        - Show daemon status (global + current project)
  *   devlog hooks         - Print hook configuration for Claude Code
@@ -18,9 +17,7 @@ import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
-import { startProxy } from './proxy/server.js';
 import { readShortTermMemory } from './storage/memory-store.js';
 import { getQueueStats } from './storage/queue.js';
 import {
@@ -70,8 +67,7 @@ async function init(): Promise<void> {
   console.log('\nNext steps:');
   console.log('  1. Run: devlog hooks');
   console.log('  2. Copy the hooks to ~/.claude/settings.json');
-  console.log('  3. Start proxy: devlog proxy');
-  console.log('  4. Start daemon: devlog daemon');
+  console.log('  3. Start daemon: devlog daemon');
   console.log('\nThat\'s it! The daemon will auto-create .memory/ in each project as needed.');
 }
 
@@ -112,16 +108,6 @@ function printHooks(): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function isPortInUse(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = createConnection({ port }, () => {
-      socket.end();
-      resolve(true);
-    });
-    socket.on('error', () => resolve(false));
-  });
 }
 
 async function isDaemonRunning(): Promise<boolean> {
@@ -325,23 +311,7 @@ async function setup(options: SetupOptions = {}): Promise<void> {
     console.log('  Run "devlog hooks" and add manually to ~/.claude/settings.json');
   }
 
-  // 4. Read config for proxy port
-  const globalConfig = await readGlobalConfig();
-  const config = globalConfig.ok ? globalConfig.value : { proxy_port: 8082 };
-
-  // 5. Start proxy (if not running)
-  const proxyRunning = await isPortInUse(config.proxy_port);
-  if (!proxyRunning) {
-    spawn('node', [join(PROJECT_ROOT, 'dist', 'cli.js'), 'proxy'], {
-      detached: true,
-      stdio: 'ignore',
-    }).unref();
-    console.log('✓ Started proxy');
-  } else {
-    console.log('✓ Proxy already running');
-  }
-
-  // 6. Start daemon (if not running)
+  // 4. Start daemon (if not running)
   const daemonRunning = await isDaemonRunning();
   if (!daemonRunning) {
     spawn('node', [join(PROJECT_ROOT, 'dist', 'cli.js'), 'daemon'], {
@@ -353,7 +323,7 @@ async function setup(options: SetupOptions = {}): Promise<void> {
     console.log('✓ Daemon already running');
   }
 
-  // 7. Wait and verify
+  // 5. Wait and verify
   await sleep(2000);
   console.log('\n✓ Setup complete!\n');
   console.log('Devlog is now running. Use Claude Code in any project:');
@@ -361,22 +331,6 @@ async function setup(options: SetupOptions = {}): Promise<void> {
   console.log('  claude');
   console.log('\nView memories with:');
   console.log('  devlog read today');
-}
-
-async function runProxy(): Promise<void> {
-  const globalConfig = await readGlobalConfig();
-  const config = globalConfig.ok ? globalConfig.value : {
-    ollama_base_url: 'http://localhost:11434',
-    ollama_model: 'llama3.2',
-    proxy_port: 8082,
-  };
-
-  await startProxy({
-    port: parseInt(process.env['PROXY_PORT'] ?? String(config.proxy_port), 10),
-    ollamaBaseUrl: process.env['OLLAMA_BASE_URL'] ?? config.ollama_base_url,
-    ollamaModel: process.env['OLLAMA_MODEL'] ?? config.ollama_model,
-    timeout: parseInt(process.env['PROXY_TIMEOUT'] ?? '120000', 10),
-  });
 }
 
 async function runDaemon(): Promise<void> {
@@ -551,15 +505,14 @@ Usage:
   devlog <command> [options]
 
 Commands:
-  setup [--yes]     Full setup (init + hooks + start services)
-  init              Initialize global ~/.devlog directory only
-  proxy             Start the Anthropic-to-Ollama proxy server
+  setup [--yes]        Full setup (init + hooks + start daemon)
+  init                 Initialize global ~/.devlog directory only
   daemon [start] [-d]  Start the global memory daemon (--debug for verbose)
   daemon stop          Stop the running daemon
-  status            Show daemon status (global + current project)
-  hooks             Print hook configuration for ~/.claude/settings.json
-  read [period]     Read memories (today, this-week, this-month)
-  config            Show current configuration
+  status               Show daemon status (global + current project)
+  hooks                Print hook configuration for ~/.claude/settings.json
+  read [period]        Read memories (today, this-week, this-month)
+  config               Show current configuration
 
 Hook Commands (internal, called by Claude Code):
   hook:post-tool-use  Handle PostToolUse events (file tracking)
@@ -569,7 +522,6 @@ Options:
   --yes, -y         Skip confirmation prompts (for setup command)
 
 Environment Variables:
-  PROXY_PORT        Proxy server port (default: from config or 8082)
   OLLAMA_BASE_URL   Ollama server URL (default: from config or http://localhost:11434)
   OLLAMA_MODEL      Ollama model (default: from config or llama3.2)
   DEVLOG_HOME       Override global directory (default: ~/.devlog)
@@ -599,10 +551,6 @@ switch (command) {
 
   case 'init':
     init();
-    break;
-
-  case 'proxy':
-    runProxy();
     break;
 
   case 'daemon': {

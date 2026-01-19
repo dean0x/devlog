@@ -7,12 +7,6 @@
 // Types
 export type {
   Result,
-  AnthropicMessage,
-  AnthropicRequest,
-  AnthropicResponse,
-  OllamaMessage,
-  OllamaRequest,
-  OllamaResponse,
   QueuedEvent,
   EventType,
   MemoryEntry,
@@ -24,18 +18,12 @@ export type {
   DaemonStatus,
   ProjectStats,
   GlobalConfig,
-  ProxyError,
   DaemonError,
   StorageError,
 } from './types/index.js';
 
 // Result type constructors and types
 export { Ok, Err, type Ok as OkType, type Err as ErrType } from './types/index.js';
-
-// Proxy
-export { createProxyApp, startProxy, type ProxyConfig } from './proxy/server.js';
-export { sendOllamaRequest, streamOllamaRequest, checkOllamaHealth } from './proxy/ollama-client.js';
-export { translateRequest, translateResponse } from './proxy/translator.js';
 
 // Storage
 export {
