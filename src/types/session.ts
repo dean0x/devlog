@@ -153,10 +153,6 @@ export interface SessionConfig {
   readonly timeout_ms: number;
   /** Minimum signals before consolidation is triggered */
   readonly min_signals_for_consolidation: number;
-  /** Whether to use the legacy per-turn processing */
-  readonly legacy_turn_processing: boolean;
-  /** Whether to enable the new session consolidation */
-  readonly session_consolidation: boolean;
 }
 
 /**
@@ -165,6 +161,4 @@ export interface SessionConfig {
 export const DEFAULT_SESSION_CONFIG: SessionConfig = {
   timeout_ms: 5 * 60 * 1000, // 5 minutes
   min_signals_for_consolidation: 1,
-  legacy_turn_processing: true,
-  session_consolidation: false,
 };

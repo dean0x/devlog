@@ -2,7 +2,7 @@
 /**
  * Devlog CLI
  *
- * Global daemon architecture - setup once, works everywhere.
+ * Session-based knowledge consolidation for Claude Code projects.
  *
  * Usage:
  *   devlog setup         - Full setup (init + hooks + start daemon)
@@ -10,7 +10,7 @@
  *   devlog daemon        - Start the global memory daemon
  *   devlog status        - Show daemon status (global + current project)
  *   devlog hooks         - Print hook configuration for Claude Code
- *   devlog read [period] - Read memories (today, this-week, this-month)
+ *   devlog knowledge     - View consolidated knowledge
  */
 
 import { join, resolve, dirname } from 'node:path';
@@ -18,8 +18,6 @@ import { homedir } from 'node:os';
 import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { readShortTermMemory } from './storage/memory-store.js';
-import { getQueueStats } from './storage/queue.js';
 import {
   readKnowledgeFile,
   searchKnowledge,
@@ -31,12 +29,22 @@ import {
 } from './storage/knowledge-store.js';
 import {
   listSessions,
+  readSession,
   finalizeSession,
   type SessionStoreConfig,
 } from './storage/session-store.js';
 import {
+  formatCatchUpSummary,
+  formatCatchUpJson,
+  generateLLMCatchUpSummary,
+} from './catch-up/summarizer.js';
+import {
+  readRecentSummaries,
+} from './catch-up/recent-sessions.js';
+import { readPrecomputedSummary } from './catch-up/precomputed-store.js';
+import type { SessionAccumulator } from './types/session.js';
+import {
   getGlobalDir,
-  getGlobalQueueDir,
   getGlobalStatusPath,
   getGlobalConfigPath,
   getProjectMemoryDir,
@@ -44,7 +52,6 @@ import {
   isGlobalInitialized,
   readGlobalConfig,
   writeGlobalConfig,
-  writeSessionConfig,
 } from './paths.js';
 import { handlePostToolUse, handleStop } from './hooks/handlers.js';
 import type { DaemonStatus } from './types/index.js';
@@ -244,7 +251,6 @@ async function setup(options: SetupOptions = {}): Promise<void> {
     const existingHooks = (settings['hooks'] ?? {}) as Record<string, unknown[]>;
 
     // Helper to check if our hook already exists in an array
-    // Detects both new CLI commands and legacy shell script paths for migration
     const hasDevlogHook = (hookArray: unknown[], command: string): boolean => {
       return hookArray.some((entry) => {
         if (typeof entry !== 'object' || entry === null) return false;
@@ -254,7 +260,6 @@ async function setup(options: SetupOptions = {}): Promise<void> {
           if (typeof h !== 'object' || h === null) return false;
           const hookCommand = (h as Record<string, unknown>)['command'];
           if (typeof hookCommand !== 'string') return false;
-          // Match exact command or legacy shell script
           return hookCommand === command ||
             hookCommand.includes('devlog') && hookCommand.includes('hook:');
         });
@@ -344,8 +349,8 @@ async function setup(options: SetupOptions = {}): Promise<void> {
   console.log('Devlog is now running. Use Claude Code in any project:');
   console.log('  cd /any/project');
   console.log('  claude');
-  console.log('\nView memories with:');
-  console.log('  devlog read today');
+  console.log('\nView knowledge with:');
+  console.log('  devlog knowledge');
 }
 
 async function runDaemon(): Promise<void> {
@@ -386,7 +391,6 @@ async function stopDaemon(): Promise<void> {
 async function showStatus(): Promise<void> {
   const globalDir = getGlobalDir();
   const statusPath = getGlobalStatusPath();
-  const queueDir = getGlobalQueueDir();
   const currentProjectPath = process.cwd();
   const currentProjectMemoryDir = getProjectMemoryDir(currentProjectPath);
 
@@ -409,18 +413,8 @@ async function showStatus(): Promise<void> {
     console.log(`  Running: ${status.running}`);
     console.log(`  PID: ${status.pid ?? 'N/A'}`);
     console.log(`  Started: ${status.started_at ?? 'N/A'}`);
-    console.log(`  Events processed: ${status.events_processed}`);
-    console.log(`  Last extraction: ${status.last_extraction ?? 'Never'}`);
-    console.log(`  Last decay: ${status.last_decay ?? 'Never'}`);
-
-    // Queue stats
-    const queueStats = await getQueueStats({ baseDir: queueDir });
-    if (queueStats.ok) {
-      console.log(`\nQueue:`);
-      console.log(`  Pending: ${queueStats.value.pending}`);
-      console.log(`  Processing: ${queueStats.value.processing}`);
-      console.log(`  Failed: ${queueStats.value.failed}`);
-    }
+    console.log(`  Sessions processed: ${status.events_processed}`);
+    console.log(`  Last consolidation: ${status.last_extraction ?? 'Never'}`);
 
     // Projects summary
     if (status.projects && Object.keys(status.projects).length > 0) {
@@ -428,7 +422,7 @@ async function showStatus(): Promise<void> {
       for (const [path, stats] of Object.entries(status.projects)) {
         const isCurrent = path === currentProjectPath ? ' (current)' : '';
         console.log(`  ${path}${isCurrent}`);
-        console.log(`    Events: ${stats.events_processed}, Memories: ${stats.memories_extracted}`);
+        console.log(`    Sessions: ${stats.events_processed}, Knowledge updates: ${stats.memories_extracted}`);
       }
     }
   } catch {
@@ -441,57 +435,21 @@ async function showStatus(): Promise<void> {
   console.log(`Memory directory: ${currentProjectMemoryDir}`);
 
   try {
-    await fs.access(currentProjectMemoryDir);
+    await fs.access(join(currentProjectMemoryDir, 'knowledge'));
     console.log('Status: Initialized');
 
-    // Read today's memories count
-    const todayResult = await readShortTermMemory({ baseDir: currentProjectMemoryDir }, 'today');
-    if (todayResult.ok) {
-      console.log(`Today's memories: ${todayResult.value.memories.length}`);
+    // Count knowledge sections
+    const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir: currentProjectMemoryDir };
+    let totalSections = 0;
+    for (const category of getAllCategories()) {
+      const result = await readKnowledgeFile(knowledgeStoreConfig, category);
+      if (result.ok) {
+        totalSections += result.value.sections.length;
+      }
     }
-
-    const weekResult = await readShortTermMemory({ baseDir: currentProjectMemoryDir }, 'this-week');
-    if (weekResult.ok) {
-      console.log(`This week's memories: ${weekResult.value.memories.length}`);
-    }
+    console.log(`Knowledge sections: ${totalSections}`);
   } catch {
-    console.log('Status: Not initialized (will auto-create on first event)');
-  }
-}
-
-async function readMemories(period: 'today' | 'this-week' | 'this-month'): Promise<void> {
-  const memoryDir = getProjectMemoryDir(process.cwd());
-
-  const result = await readShortTermMemory({ baseDir: memoryDir }, period);
-  if (!result.ok) {
-    if (result.error.type === 'read_error' && result.error.message.includes('ENOENT')) {
-      console.log('No memories found for this project yet.');
-      console.log('Memories will be auto-created when you use Claude Code with devlog hooks.');
-      return;
-    }
-    console.error(`Failed to read memories: ${result.error.message}`);
-    process.exit(1);
-  }
-
-  const { memories, date, last_updated } = result.value;
-
-  console.log(`\n=== ${period.toUpperCase()} (${date}) ===`);
-  console.log(`Last updated: ${last_updated}\n`);
-
-  if (memories.length === 0) {
-    console.log('No memories recorded yet.');
-    return;
-  }
-
-  for (const memory of memories) {
-    const time = memory.timestamp.split('T')[1]?.split('.')[0] ?? '';
-    console.log(`[${time}] ${memory.type.toUpperCase()}: ${memory.title}`);
-    console.log(`  ${memory.content}`);
-    if (memory.files && memory.files.length > 0) {
-      console.log(`  Files: ${memory.files.join(', ')}`);
-    }
-    console.log(`  Confidence: ${(memory.confidence * 100).toFixed(0)}%`);
-    console.log();
+    console.log('Status: Not initialized (will auto-create on first session)');
   }
 }
 
@@ -511,7 +469,7 @@ async function showConfig(): Promise<void> {
 }
 
 // ============================================================================
-// Knowledge Commands (New System)
+// Knowledge Commands
 // ============================================================================
 
 async function consolidate(): Promise<void> {
@@ -623,8 +581,8 @@ async function showKnowledge(category?: string): Promise<void> {
 
     if (totalSections === 0) {
       console.log('No knowledge yet. Knowledge is created from your Claude Code sessions.\n');
-      console.log('To enable session consolidation, run:');
-      console.log('  devlog feature:enable session_consolidation\n');
+      console.log('Use Claude Code with devlog hooks enabled, then run:');
+      console.log('  devlog consolidate\n');
     } else {
       console.log(`Total: ${totalSections} knowledge sections\n`);
       console.log('To view a specific category:');
@@ -669,39 +627,110 @@ async function searchKnowledgeCommand(query: string): Promise<void> {
   }
 }
 
-async function toggleFeature(feature: string, enable: boolean): Promise<void> {
-  if (feature === 'session_consolidation') {
-    const result = await writeSessionConfig({ session_consolidation: enable });
-    if (result.ok) {
-      console.log(`Session consolidation ${enable ? 'enabled' : 'disabled'}.`);
-      if (enable) {
-        console.log('\nThe new session-based system will now:');
-        console.log('  - Accumulate signals during Claude Code sessions');
-        console.log('  - Consolidate knowledge at session end (5 min timeout)');
-        console.log('  - Store knowledge in .memory/knowledge/ files');
-        console.log('\nNote: Legacy per-turn processing is still active for backward compatibility.');
+// ============================================================================
+// Catch-Up Command
+// ============================================================================
+
+interface CatchUpOptions {
+  json: boolean;
+  raw: boolean;
+}
+
+async function catchUp(options: CatchUpOptions): Promise<void> {
+  const memoryDir = getProjectMemoryDir(process.cwd());
+  const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+
+  // Get active sessions
+  const listResult = await listSessions(sessionStoreConfig);
+  if (!listResult.ok) {
+    console.error(`Failed to list sessions: ${listResult.error.message}`);
+    return;
+  }
+
+  const activeSessions: SessionAccumulator[] = [];
+  for (const sessionId of listResult.value) {
+    const readResult = await readSession(sessionStoreConfig, sessionId);
+    if (readResult.ok && readResult.value !== null) {
+      // Only include active sessions (not consolidating/closed)
+      if (readResult.value.status === 'active') {
+        activeSessions.push(readResult.value);
       }
-    } else {
-      console.error(`Failed to update config: ${result.error.message}`);
     }
-  } else if (feature === 'legacy_turn_processing') {
-    const result = await writeSessionConfig({ legacy_turn_processing: enable });
-    if (result.ok) {
-      console.log(`Legacy turn processing ${enable ? 'enabled' : 'disabled'}.`);
-    } else {
-      console.error(`Failed to update config: ${result.error.message}`);
+  }
+
+  // Get recent session summaries
+  const summariesResult = await readRecentSummaries({ memoryDir });
+  const recentSummaries = summariesResult.ok ? summariesResult.value : [];
+
+  // Filter to current project only
+  const currentProjectPath = process.cwd();
+  const projectSummaries = recentSummaries.filter(
+    s => s.project_path === currentProjectPath
+  );
+
+  if (options.json) {
+    const data = formatCatchUpJson(activeSessions, projectSummaries);
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  if (options.raw) {
+    // Raw mode: show filtered signals without LLM
+    const summary = formatCatchUpSummary(activeSessions, projectSummaries);
+    console.log(summary);
+    return;
+  }
+
+  // Default: try pre-computed summary first (instant!)
+  const precomputed = await readPrecomputedSummary(memoryDir);
+
+  if (precomputed.ok && precomputed.value) {
+    console.log(precomputed.value.summary);
+
+    // Show warnings if applicable
+    if (precomputed.value.status === 'stale') {
+      console.error('\n(Summary may be outdated - daemon will refresh soon)');
+    }
+    if (precomputed.value.last_error) {
+      console.error(`\n(Last update failed: ${precomputed.value.last_error})`);
+    }
+    return;
+  }
+
+  // Fallback: No pre-computed summary (first run or daemon not running)
+  // Generate on-demand (existing behavior)
+  const configResult = await readGlobalConfig();
+  const config = configResult.ok ? configResult.value : {
+    ollama_base_url: 'http://localhost:11434',
+    ollama_model: 'llama3.2',
+  };
+
+  const llmResult = await generateLLMCatchUpSummary(
+    activeSessions,
+    projectSummaries,
+    memoryDir,
+    {
+      ollamaUrl: process.env['OLLAMA_BASE_URL'] ?? config.ollama_base_url,
+      model: process.env['OLLAMA_MODEL'] ?? config.ollama_model,
+    }
+  );
+
+  if (llmResult.ok) {
+    console.log(llmResult.value.summary);
+    if (llmResult.value.error) {
+      console.error(`\n(Ollama unavailable: ${llmResult.value.error}, showing raw signals)`);
     }
   } else {
-    console.error(`Unknown feature: ${feature}`);
-    console.log('\nAvailable features:');
-    console.log('  session_consolidation   - New session-based knowledge consolidation');
-    console.log('  legacy_turn_processing  - Original per-turn memo extraction');
+    // Should not happen since we always return Ok, but handle gracefully
+    console.error(`Unexpected error: ${llmResult.error.message}`);
+    const fallback = formatCatchUpSummary(activeSessions, projectSummaries);
+    console.log(fallback);
   }
 }
 
 function printUsage(): void {
   console.log(`
-Devlog - Background memory extraction for Claude Code
+Devlog - Session-based knowledge consolidation for Claude Code
 
 Global daemon architecture - setup once, works everywhere.
 
@@ -715,25 +744,19 @@ Commands:
   daemon stop          Stop the running daemon
   status               Show daemon status (global + current project)
   hooks                Print hook configuration for ~/.claude/settings.json
-  read [period]        Read memories (today, this-week, this-month)
   config               Show current configuration
 
-Knowledge Commands (new session-based system):
+Knowledge Commands:
   consolidate          Force consolidation of active sessions
   knowledge [category] View knowledge files (conventions, architecture, decisions, gotchas)
   search <query>       Search across all knowledge
-
-Feature Flags:
-  feature:enable <feature>   Enable a feature
-  feature:disable <feature>  Disable a feature
-
-  Features:
-    session_consolidation   - New session-based knowledge system
-    legacy_turn_processing  - Original per-turn memo extraction
+  catch-up [options]   Show what you were working on (for context restoration)
+                       --raw   Show filtered signals without LLM summary
+                       --json  Output as JSON
 
 Hook Commands (internal, called by Claude Code):
   hook:post-tool-use  Handle PostToolUse events (file tracking)
-  hook:stop           Handle Stop events (memo extraction)
+  hook:stop           Handle Stop events (session signal accumulation)
 
 Options:
   --yes, -y         Skip confirmation prompts (for setup command)
@@ -747,15 +770,11 @@ Environment Variables:
 Quick Start:
   devlog setup             # One command does everything!
 
-  # Use Claude Code in any project - memories auto-created
+  # Use Claude Code in any project - knowledge auto-consolidates
   cd /any/project
   claude                   # Just works!
 
-  # View this project's memories
-  devlog read today
-
-  # Enable new session-based knowledge system
-  devlog feature:enable session_consolidation
+  # View this project's knowledge
   devlog knowledge
 `);
 }
@@ -803,20 +822,11 @@ switch (command) {
     printHooks();
     break;
 
-  case 'read':
-    const period = (process.argv[3] ?? 'today') as 'today' | 'this-week' | 'this-month';
-    if (!['today', 'this-week', 'this-month'].includes(period)) {
-      console.error('Invalid period. Use: today, this-week, or this-month');
-      process.exit(1);
-    }
-    readMemories(period);
-    break;
-
   case 'config':
     showConfig();
     break;
 
-  // Knowledge commands (new session-based system)
+  // Knowledge commands
   case 'consolidate':
     consolidate();
     break;
@@ -829,14 +839,13 @@ switch (command) {
     searchKnowledgeCommand(process.argv.slice(3).join(' '));
     break;
 
-  // Feature flag commands
-  case 'feature:enable':
-    toggleFeature(process.argv[3] ?? '', true);
+  case 'catch-up': {
+    const catchUpArgs = process.argv.slice(3);
+    const jsonFlag = catchUpArgs.includes('--json');
+    const rawFlag = catchUpArgs.includes('--raw');
+    catchUp({ json: jsonFlag, raw: rawFlag });
     break;
-
-  case 'feature:disable':
-    toggleFeature(process.argv[3] ?? '', false);
-    break;
+  }
 
   // Hook commands (called by Claude Code, not user-facing)
   case 'hook:post-tool-use':

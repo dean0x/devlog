@@ -2,20 +2,16 @@
 /**
  * Memory Daemon (memoryd)
  *
- * ARCHITECTURE: Global background process that extracts and manages memories
- * Pattern: Event loop with graceful shutdown, multi-project routing
+ * ARCHITECTURE: Global background process that consolidates session knowledge
+ * Pattern: Periodic polling for stale sessions, consolidation via LLM
  *
- * Global daemon watches ~/.devlog/queue and routes memories to the
- * appropriate project's .memory/ directory based on event.project_path.
+ * The daemon watches for stale sessions across all known projects and
+ * consolidates them into the knowledge store (.memory/knowledge/).
  *
  * Responsibilities:
- *   1. Watch global queue for new events
- *   2. Group events by project_path
- *   3. Extract memories per project
- *   4. Auto-init project .memory/ directories
- *   5. Store memories in correct project
- *   6. Run scheduled decay jobs per project
- *   7. Track per-project statistics
+ *   1. Periodically check for stale sessions in known projects
+ *   2. Consolidate session signals into structured knowledge
+ *   3. Track per-project statistics
  */
 
 import { promises as fs } from 'node:fs';
@@ -74,28 +70,36 @@ function createLogger(): Logger {
 }
 
 const logger = createLogger();
-import { watchQueue, completeBatch, failBatch, type WatcherConfig } from './watcher.js';
+
 import {
-  extractMemoWithContext,
-  memoToMemoryEntry,
   extractSessionKnowledge,
   type ExtractorConfig,
   type SessionConsolidationDecision,
 } from './extractor.js';
-import { runDecay } from './decay.js';
-import { evaluateForPromotion, cleanupStaleCandidates, type PromotionConfig } from './promotion.js';
-import { evaluateGates, shouldProcessSession } from './extraction-gates.js';
-import { initQueue } from '../storage/queue.js';
+import { generateSessionSummary } from '../catch-up/summarizer.js';
 import {
-  appendToShortTermMemory,
-  updateMemoryEntry,
-  type MemoryStoreConfig,
-} from '../storage/memory-store.js';
+  saveSessionSummary,
+  pruneToLimit,
+  readRecentSummaries,
+  DEFAULT_CATCH_UP_CONFIG,
+  type SessionStoreConfig as CatchUpSessionStoreConfig,
+} from '../catch-up/recent-sessions.js';
+import { generateLLMSummary, computeCacheHash } from '../catch-up/llm-summarizer.js';
+import {
+  readPrecomputedSummary,
+  writePrecomputedSummary,
+  readCatchUpState,
+  clearCatchUpDirty,
+  shouldRecomputeSummary,
+} from '../catch-up/precomputed-store.js';
+import { evaluateGates, shouldProcessSession } from './extraction-gates.js';
 import {
   findStaleSessions,
   finalizeSession,
   archiveSession,
   findSessionsToConsolidate,
+  listSessions,
+  readSession,
   type SessionStoreConfig,
 } from '../storage/session-store.js';
 import {
@@ -111,16 +115,14 @@ import {
 } from '../storage/knowledge-store.js';
 import {
   getGlobalDir,
-  getGlobalQueueDir,
   getGlobalStatusPath,
   getProjectMemoryDir,
   initGlobalDirs,
-  initProjectMemory,
-  isProjectMemoryInitialized,
   readGlobalConfig,
   readSessionConfig,
+  consumePendingProjects,
 } from '../paths.js';
-import type { DaemonConfig, DaemonStatus, QueuedEvent, ProjectStats } from '../types/index.js';
+import type { DaemonStatus, ProjectStats } from '../types/index.js';
 import type { SessionConfig, SessionAccumulator } from '../types/session.js';
 import { DEFAULT_SESSION_CONFIG } from '../types/session.js';
 
@@ -136,7 +138,13 @@ function getPidFilePath(): string {
 // Configuration
 // ============================================================================
 
-async function loadConfig(): Promise<DaemonConfig> {
+interface SimpleDaemonConfig {
+  readonly ollama_url: string;
+  readonly ollama_model: string;
+  readonly poll_interval_ms: number;
+}
+
+async function loadConfig(): Promise<SimpleDaemonConfig> {
   const globalConfig = await readGlobalConfig();
   const config = globalConfig.ok ? globalConfig.value : {
     ollama_base_url: 'http://localhost:11434',
@@ -146,15 +154,7 @@ async function loadConfig(): Promise<DaemonConfig> {
   return {
     ollama_url: process.env['OLLAMA_BASE_URL'] ?? config.ollama_base_url,
     ollama_model: process.env['OLLAMA_MODEL'] ?? config.ollama_model,
-    memory_dir: getGlobalDir(), // Used for global status
-    queue_dir: getGlobalQueueDir(),
-    batch_size: parseInt(process.env['BATCH_SIZE'] ?? '5', 10),
     poll_interval_ms: parseInt(process.env['POLL_INTERVAL'] ?? '5000', 10),
-    decay_schedule: {
-      daily_hour: 2, // 2 AM
-      weekly_day: 1, // Monday
-      monthly_day: 1, // 1st of month
-    },
   };
 }
 
@@ -165,18 +165,16 @@ async function loadConfig(): Promise<DaemonConfig> {
 interface DaemonState {
   running: boolean;
   startedAt: Date;
-  eventsProcessed: number;
-  lastExtraction: Date | null;
-  lastDecay: Date | null;
+  sessionsProcessed: number;
+  lastConsolidation: Date | null;
   projects: Map<string, ProjectStats>;
 }
 
 let state: DaemonState = {
   running: false,
   startedAt: new Date(),
-  eventsProcessed: 0,
-  lastExtraction: null,
-  lastDecay: null,
+  sessionsProcessed: 0,
+  lastConsolidation: null,
   projects: new Map(),
 };
 
@@ -185,17 +183,16 @@ async function writeStatus(): Promise<void> {
 
   // Convert projects Map to plain object
   const projectsObj: { [path: string]: ProjectStats } = {};
-  for (const [path, stats] of state.projects) {
-    projectsObj[path] = stats;
+  for (const [projectPath, stats] of state.projects) {
+    projectsObj[projectPath] = stats;
   }
 
   const status: DaemonStatus = {
     running: state.running,
     pid: process.pid,
     started_at: state.startedAt.toISOString(),
-    events_processed: state.eventsProcessed,
-    last_extraction: state.lastExtraction?.toISOString(),
-    last_decay: state.lastDecay?.toISOString(),
+    events_processed: state.sessionsProcessed,
+    last_extraction: state.lastConsolidation?.toISOString(),
     projects: projectsObj,
   };
 
@@ -206,86 +203,24 @@ async function writeStatus(): Promise<void> {
   }
 }
 
-function updateProjectStats(projectPath: string, eventsProcessed: number, memoriesExtracted: number): void {
+function updateProjectStats(projectPath: string, sessionsProcessed: number): void {
   const existing = state.projects.get(projectPath);
   const updated: ProjectStats = {
-    events_processed: (existing?.events_processed ?? 0) + eventsProcessed,
-    memories_extracted: (existing?.memories_extracted ?? 0) + memoriesExtracted,
+    events_processed: (existing?.events_processed ?? 0) + sessionsProcessed,
+    memories_extracted: (existing?.memories_extracted ?? 0) + sessionsProcessed,
     last_activity: new Date().toISOString(),
   };
   state.projects.set(projectPath, updated);
 }
 
 // ============================================================================
-// Scheduled Jobs
-// ============================================================================
-
-function shouldRunDecay(config: DaemonConfig): boolean {
-  const now = new Date();
-  const hour = now.getHours();
-
-  // Run decay at configured hour, once per day
-  if (hour !== config.decay_schedule.daily_hour) {
-    return false;
-  }
-
-  // Check if we already ran today
-  if (state.lastDecay) {
-    const lastDecayDate = state.lastDecay.toDateString();
-    const todayDate = now.toDateString();
-    if (lastDecayDate === todayDate) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-async function runScheduledDecayForAllProjects(_config: DaemonConfig): Promise<void> {
-  logger.info('Running scheduled decay for all projects...');
-
-  // Run decay for each known project
-  for (const projectPath of state.projects.keys()) {
-    const memoryDir = getProjectMemoryDir(projectPath);
-
-    const result = await runDecay(memoryDir);
-    if (result.ok) {
-      logger.info(`Decay completed for ${projectPath}`, {
-        daily_moved: result.value.daily.moved,
-        daily_filtered: result.value.daily.filtered,
-        weekly_moved: result.value.weekly.moved,
-        monthly_archived: result.value.monthly.archived,
-      });
-    } else {
-      logger.error(`Decay failed for ${projectPath}`, { error: result.error.message });
-    }
-
-    // Also cleanup stale candidates
-    const promotionConfig: PromotionConfig = {
-      memoryDir,
-      minOccurrences: 3,
-      minAverageConfidence: 0.85,
-      minDaySpread: 3,
-    };
-
-    const cleanupResult = await cleanupStaleCandidates(promotionConfig);
-    if (cleanupResult.ok && cleanupResult.value.removed > 0) {
-      logger.info(`Cleaned up ${cleanupResult.value.removed} stale promotion candidates`, { project: projectPath });
-    }
-  }
-
-  state.lastDecay = new Date();
-}
-
-// ============================================================================
-// Session Processing (New System)
+// Session Processing
 // ============================================================================
 
 /**
  * Check for stale sessions and trigger consolidation
  */
 async function checkForStaleSessions(
-  config: DaemonConfig,
   extractorConfig: ExtractorConfig
 ): Promise<void> {
   // Read session config
@@ -293,11 +228,6 @@ async function checkForStaleSessions(
   const sessionConfig: SessionConfig = sessionConfigResult.ok
     ? sessionConfigResult.value
     : DEFAULT_SESSION_CONFIG;
-
-  // Skip if session consolidation is disabled
-  if (!sessionConfig.session_consolidation) {
-    return;
-  }
 
   // Get all known projects
   for (const projectPath of state.projects.keys()) {
@@ -330,14 +260,13 @@ async function checkForStaleSessions(
   }
 
   // Process all sessions that need consolidation
-  await processSessionConsolidations(config, extractorConfig);
+  await processSessionConsolidations(extractorConfig);
 }
 
 /**
  * Process sessions that are ready for consolidation
  */
 async function processSessionConsolidations(
-  _config: DaemonConfig,
   extractorConfig: ExtractorConfig
 ): Promise<void> {
   for (const projectPath of state.projects.keys()) {
@@ -368,6 +297,17 @@ async function processSessionConsolidations(
       );
 
       if (result.success) {
+        // Save session summary for catch-up feature
+        const catchUpConfig: CatchUpSessionStoreConfig = { memoryDir };
+        const summary = generateSessionSummary(session);
+        const saveResult = await saveSessionSummary(catchUpConfig, summary);
+        if (!saveResult.ok) {
+          logger.warn(`Failed to save session summary: ${saveResult.error.message}`);
+        } else {
+          // Prune old summaries to enforce retention limit
+          await pruneToLimit(catchUpConfig, DEFAULT_CATCH_UP_CONFIG.max_sessions);
+        }
+
         // Archive the session
         await archiveSession(sessionStoreConfig, session.session_id);
 
@@ -380,6 +320,10 @@ async function processSessionConsolidations(
           action: result.action,
           knowledge_updated: result.knowledgeUpdated,
         });
+
+        updateProjectStats(projectPath, 1);
+        state.sessionsProcessed++;
+        state.lastConsolidation = new Date();
       } else {
         logger.warn(`Session consolidation failed: ${result.error}`, {
           session_id: session.session_id,
@@ -569,225 +513,189 @@ async function applyConsolidationDecision(
 }
 
 // ============================================================================
-// Multi-Project Event Processing
+// Catch-Up Summary Pre-Computation
 // ============================================================================
 
 /**
- * Group events by their project_path
+ * Get active sessions for a project
  */
-function groupEventsByProject(events: readonly QueuedEvent[]): Map<string, QueuedEvent[]> {
-  const grouped = new Map<string, QueuedEvent[]>();
+async function getActiveSessionsForProject(
+  memoryDir: string
+): Promise<readonly import('../types/session.js').SessionAccumulator[]> {
+  const sessionStoreConfig: SessionStoreConfig = { memoryDir };
 
-  for (const event of events) {
-    const projectPath = event.project_path;
-    const existing = grouped.get(projectPath);
-    if (existing) {
-      existing.push(event);
-    } else {
-      grouped.set(projectPath, [event]);
+  const listResult = await listSessions(sessionStoreConfig);
+  if (!listResult.ok) {
+    return [];
+  }
+
+  const activeSessions: import('../types/session.js').SessionAccumulator[] = [];
+  for (const sessionId of listResult.value) {
+    const readResult = await readSession(sessionStoreConfig, sessionId);
+    if (readResult.ok && readResult.value !== null && readResult.value.status === 'active') {
+      activeSessions.push(readResult.value);
     }
   }
 
-  return grouped;
+  return activeSessions;
 }
 
 /**
- * Process events for a single project using context-aware extraction
+ * Update pre-computed catch-up summaries for all known projects
  *
- * ARCHITECTURE: Uses new extractMemoWithContext for smarter decisions
- * Pattern: create/update/skip based on existing context
+ * ARCHITECTURE: Background computation with debouncing
+ * - Only recomputes when dirty flag is set and debounce period has elapsed
+ * - Stores result for instant retrieval by CLI
  */
-async function processProjectEvents(
-  projectPath: string,
-  events: readonly QueuedEvent[],
+async function updateCatchUpSummariesIfNeeded(
   extractorConfig: ExtractorConfig
-): Promise<{ success: boolean; memoriesExtracted: number; memoriesUpdated: number; error?: string }> {
-  const memoryDir = getProjectMemoryDir(projectPath);
+): Promise<void> {
+  for (const projectPath of state.projects.keys()) {
+    const memoryDir = getProjectMemoryDir(projectPath);
 
-  // Auto-init project memory if needed
-  const initialized = await isProjectMemoryInitialized(projectPath);
-  if (!initialized) {
-    logger.info(`Auto-initializing memory for project: ${projectPath}`);
-    const initResult = await initProjectMemory(projectPath);
-    if (!initResult.ok) {
-      return { success: false, memoriesExtracted: 0, memoriesUpdated: 0, error: initResult.error.message };
-    }
-  }
+    // Check if recomputation is needed
+    const catchUpStateResult = await readCatchUpState(memoryDir);
+    const currentSummaryResult = await readPrecomputedSummary(memoryDir);
 
-  const storeConfig: MemoryStoreConfig = { baseDir: memoryDir };
-  const promotionConfig: PromotionConfig = {
-    memoryDir,
-    minOccurrences: 3,
-    minAverageConfidence: 0.85,
-    minDaySpread: 3,
-  };
+    const catchUpState = catchUpStateResult.ok ? catchUpStateResult.value : null;
+    const currentSummary = currentSummaryResult.ok ? currentSummaryResult.value : null;
 
-  let memoriesExtracted = 0;
-  let memoriesUpdated = 0;
-
-  // Process each event with context-aware extraction
-  for (const event of events) {
-    const decision = await extractMemoWithContext(event, memoryDir, extractorConfig);
-
-    if (!decision.ok) {
-      logger.warn(`Extraction failed for event ${event.id}`, {
-        project: projectPath,
-        error: decision.error.message,
-      });
+    if (!shouldRecomputeSummary(catchUpState, currentSummary)) {
       continue;
     }
 
-    const { action, memo, updateTarget, updateFields, reasoning } = decision.value;
+    logger.debug('Recomputing catch-up summary', { project: projectPath });
 
-    switch (action) {
-      case 'create':
-        if (memo) {
-          const memoryEntry = memoToMemoryEntry(memo);
-          const storeResult = await appendToShortTermMemory(storeConfig, 'today', [memoryEntry]);
-          if (storeResult.ok) {
-            memoriesExtracted++;
-            logger.info(`Created memo: ${memo.title}`, {
-              type: memo.type,
-              project: projectPath,
-              source: memo.source,
-            });
-            logger.debug('Memo content', { content: memo.content });
+    // Get active sessions and recent summaries
+    const [activeSessions, recentSummariesResult] = await Promise.all([
+      getActiveSessionsForProject(memoryDir),
+      readRecentSummaries({ memoryDir }),
+    ]);
 
-            // Evaluate for promotion
-            const promoResult = await evaluateForPromotion([memoryEntry], promotionConfig);
-            if (promoResult.ok && promoResult.value.promoted > 0) {
-              logger.info(`Promoted memo to long-term storage`, { project: projectPath });
-            }
-          } else {
-            logger.warn(`Failed to store memo: ${storeResult.error.message}`, { project: projectPath });
-          }
-        }
-        break;
+    const recentSummaries = recentSummariesResult.ok ? recentSummariesResult.value : [];
 
-      case 'update':
-        if (updateTarget && updateFields) {
-          const updateResult = await updateMemoryEntry(
-            storeConfig,
-            'today',
-            updateTarget,
-            updateFields
-          );
-          if (updateResult.ok) {
-            memoriesUpdated++;
-            logger.info(`Updated memo ${updateTarget}`, { project: projectPath });
-          } else {
-            // If today fails, try this-week
-            const weekResult = await updateMemoryEntry(
-              storeConfig,
-              'this-week',
-              updateTarget,
-              updateFields
-            );
-            if (weekResult.ok) {
-              memoriesUpdated++;
-              logger.info(`Updated memo ${updateTarget} (this-week)`, { project: projectPath });
-            } else {
-              logger.warn(`Failed to update memo ${updateTarget}: ${updateResult.error.message}`, { project: projectPath });
-            }
-          }
-        }
-        break;
+    // Filter to current project only
+    const projectSummaries = recentSummaries.filter(s => s.project_path === projectPath);
 
-      case 'skip':
-        logger.debug(`Skipped event`, { project: projectPath, reason: reasoning });
-        break;
+    // Generate summary using LLM
+    const result = await generateLLMSummary(
+      activeSessions,
+      projectSummaries,
+      memoryDir,
+      {
+        ollamaUrl: extractorConfig.ollamaUrl,
+        model: extractorConfig.model,
+        timeout: 30000, // 30s timeout for catch-up summarization
+      }
+    );
+
+    if (result.ok) {
+      // Compute hash for cache validation
+      const sourceHash = computeCacheHash(activeSessions, projectSummaries);
+
+      await writePrecomputedSummary(memoryDir, {
+        source_hash: sourceHash,
+        summary: result.value.summary,
+        generated_at: new Date().toISOString(),
+        status: 'fresh',
+      });
+      await clearCatchUpDirty(memoryDir);
+
+      logger.info('Updated catch-up summary', {
+        project: projectPath,
+        fromCache: result.value.fromCache,
+      });
+    } else {
+      // Record error, mark as stale if we have a previous summary
+      if (currentSummary) {
+        await writePrecomputedSummary(memoryDir, {
+          ...currentSummary,
+          status: 'stale',
+          last_error: result.error.message,
+        });
+      }
+
+      logger.warn('Failed to update catch-up summary', {
+        project: projectPath,
+        error: result.error.message,
+      });
     }
   }
+}
 
-  return { success: true, memoriesExtracted, memoriesUpdated };
+// ============================================================================
+// Project Discovery
+// ============================================================================
+
+/**
+ * Discover new projects registered by hooks
+ */
+async function discoverNewProjects(): Promise<void> {
+  const pendingResult = await consumePendingProjects();
+  if (!pendingResult.ok) {
+    logger.warn('Failed to read pending projects', { error: pendingResult.error.message });
+    return;
+  }
+
+  for (const projectPath of pendingResult.value) {
+    if (state.projects.has(projectPath)) {
+      continue; // Already known
+    }
+
+    // Verify the project has a .memory/working directory
+    const memoryDir = getProjectMemoryDir(projectPath);
+    try {
+      await fs.access(path.join(memoryDir, 'working'));
+      state.projects.set(projectPath, {
+        events_processed: 0,
+        memories_extracted: 0,
+        last_activity: new Date().toISOString(),
+      });
+      logger.info(`Discovered new project: ${projectPath}`);
+    } catch {
+      logger.debug(`Ignoring project without .memory/working: ${projectPath}`);
+    }
+  }
 }
 
 // ============================================================================
 // Main Event Loop
 // ============================================================================
 
-async function processEvents(config: DaemonConfig): Promise<void> {
-  const watcherConfig: WatcherConfig = {
-    queueDir: config.queue_dir,
-    batchSize: config.batch_size,
-    pollIntervalMs: config.poll_interval_ms,
-  };
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
+async function processLoop(config: SimpleDaemonConfig): Promise<void> {
   const extractorConfig: ExtractorConfig = {
     ollamaUrl: config.ollama_url,
     model: config.ollama_model,
     timeout: 60000,
   };
 
-  logger.info('Starting event processor...');
+  logger.info('Starting session consolidation loop...');
 
-  for await (const batchResult of watchQueue(watcherConfig)) {
-    if (!state.running) {
-      break;
-    }
+  while (state.running) {
+    try {
+      // Discover any new projects registered by hooks
+      await discoverNewProjects();
 
-    // Check for scheduled decay
-    if (shouldRunDecay(config)) {
-      await runScheduledDecayForAllProjects(config);
-    }
+      // Check for stale sessions across all known projects
+      await checkForStaleSessions(extractorConfig);
 
-    // Check for stale sessions (new system)
-    await checkForStaleSessions(config, extractorConfig);
-
-    if (!batchResult.ok) {
-      logger.error('Queue error', { error: batchResult.error.message });
-      continue;
-    }
-
-    const { events, filenames } = batchResult.value;
-    logger.info(`Processing batch of ${events.length} events...`);
-
-    // Group events by project
-    const eventsByProject = groupEventsByProject(events);
-    let allSucceeded = true;
-    let totalCreated = 0;
-    let totalUpdated = 0;
-
-    for (const [projectPath, projectEvents] of eventsByProject) {
-      logger.info(`Processing ${projectEvents.length} events for ${projectPath}`);
-      logger.debug('Event details', {
-        project: projectPath,
-        event_count: projectEvents.length,
-        files: projectEvents.flatMap(e => e.files_touched).slice(0, 5),
+      // Update pre-computed catch-up summaries (background task)
+      await updateCatchUpSummariesIfNeeded(extractorConfig);
+    } catch (error) {
+      logger.error('Error in consolidation loop', {
+        error: error instanceof Error ? error.message : String(error),
       });
-
-      const result = await processProjectEvents(projectPath, projectEvents, extractorConfig);
-
-      if (result.success) {
-        updateProjectStats(projectPath, projectEvents.length, result.memoriesExtracted);
-        totalCreated += result.memoriesExtracted;
-        totalUpdated += result.memoriesUpdated;
-        if (result.memoriesExtracted > 0 || result.memoriesUpdated > 0) {
-          logger.info(`${projectPath}: Created ${result.memoriesExtracted}, Updated ${result.memoriesUpdated}`);
-        } else {
-          logger.debug(`${projectPath}: No memos created (events may have been trivial)`);
-        }
-      } else {
-        logger.error(`${projectPath}: Failed`, { error: result.error });
-        allSucceeded = false;
-      }
-    }
-
-    if (allSucceeded) {
-      // Mark batch as complete
-      await completeBatch(filenames, watcherConfig);
-      state.eventsProcessed += events.length;
-
-      if (totalCreated > 0 || totalUpdated > 0) {
-        state.lastExtraction = new Date();
-      }
-    } else {
-      // Mark batch as failed
-      await failBatch(filenames, 'Processing failed for one or more projects', watcherConfig);
     }
 
     // Update status
     await writeStatus();
+
+    // Wait before next poll
+    await sleep(config.poll_interval_ms);
   }
 }
 
@@ -795,13 +703,12 @@ async function processEvents(config: DaemonConfig): Promise<void> {
 // Lifecycle Management
 // ============================================================================
 
-async function startup(config: DaemonConfig): Promise<void> {
-  logger.info('Initializing global memory daemon...');
+async function startup(config: SimpleDaemonConfig): Promise<void> {
+  logger.info('Initializing session consolidation daemon...');
   logger.info(`Global dir: ${getGlobalDir()}`);
-  logger.info(`Queue dir: ${config.queue_dir}`);
   logger.info(`Ollama URL: ${config.ollama_url}`);
   logger.info(`Ollama model: ${config.ollama_model}`);
-  logger.debug('Config details', { batch_size: config.batch_size, poll_interval: config.poll_interval_ms });
+  logger.debug('Config details', { poll_interval: config.poll_interval_ms });
   if (logger.isDebug()) {
     logger.info('Debug mode enabled - verbose logging active');
   }
@@ -812,31 +719,62 @@ async function startup(config: DaemonConfig): Promise<void> {
     throw new Error(`Failed to initialize global directories: ${globalInitResult.error.message}`);
   }
 
-  // Initialize queue
-  const queueResult = await initQueue({ baseDir: config.queue_dir });
-  if (!queueResult.ok) {
-    throw new Error(`Failed to initialize queue: ${queueResult.error.message}`);
-  }
-
   // Write PID file for daemon management
   const pidFile = getPidFilePath();
   await fs.writeFile(pidFile, process.pid.toString());
   logger.debug(`PID file written: ${pidFile}`);
 
+  // Load existing projects from status file (if any)
+  const loadedProjects = await loadProjectsFromStatus();
+
   state = {
     running: true,
     startedAt: new Date(),
-    eventsProcessed: 0,
-    lastExtraction: null,
-    lastDecay: null,
-    projects: new Map(),
+    sessionsProcessed: 0,
+    lastConsolidation: null,
+    projects: loadedProjects,
   };
+
+  if (loadedProjects.size > 0) {
+    logger.info(`Restored ${loadedProjects.size} project(s) from previous session`);
+  }
 
   await writeStatus();
 }
 
+/**
+ * Load projects from existing status file (if daemon was restarted)
+ */
+async function loadProjectsFromStatus(): Promise<Map<string, ProjectStats>> {
+  const projects = new Map<string, ProjectStats>();
+  const statusPath = getGlobalStatusPath();
+
+  try {
+    const content = await fs.readFile(statusPath, 'utf-8');
+    const status = JSON.parse(content) as DaemonStatus;
+
+    if (status.projects) {
+      for (const [projectPath, stats] of Object.entries(status.projects)) {
+        // Verify the project still has a .memory directory
+        const memoryDir = getProjectMemoryDir(projectPath);
+        try {
+          await fs.access(path.join(memoryDir, 'working'));
+          projects.set(projectPath, stats);
+          logger.debug(`Restored project: ${projectPath}`);
+        } catch {
+          logger.debug(`Skipping stale project (no .memory): ${projectPath}`);
+        }
+      }
+    }
+  } catch {
+    // No status file or invalid - start fresh
+  }
+
+  return projects;
+}
+
 async function shutdown(): Promise<void> {
-  logger.info('Shutting down memory daemon...');
+  logger.info('Shutting down daemon...');
   state.running = false;
   await writeStatus();
 
@@ -866,8 +804,8 @@ async function main(): Promise<void> {
 
   try {
     await startup(config);
-    logger.info('Global memory daemon running. Press Ctrl+C to stop.');
-    await processEvents(config);
+    logger.info('Session consolidation daemon running. Press Ctrl+C to stop.');
+    await processLoop(config);
   } catch (error) {
     // Print full stack trace for debugging
     if (error instanceof Error && error.stack) {
@@ -893,19 +831,18 @@ async function showStatus(): Promise<void> {
     const content = await fs.readFile(statusPath, 'utf-8');
     const status = JSON.parse(content) as DaemonStatus;
 
-    console.log('Global Memory Daemon Status:');
+    console.log('Session Consolidation Daemon Status:');
     console.log(`  Running: ${status.running}`);
     console.log(`  PID: ${status.pid ?? 'N/A'}`);
     console.log(`  Started: ${status.started_at ?? 'N/A'}`);
-    console.log(`  Events processed: ${status.events_processed}`);
-    console.log(`  Last extraction: ${status.last_extraction ?? 'Never'}`);
-    console.log(`  Last decay: ${status.last_decay ?? 'Never'}`);
+    console.log(`  Sessions processed: ${status.events_processed}`);
+    console.log(`  Last consolidation: ${status.last_extraction ?? 'Never'}`);
 
     if (status.projects && Object.keys(status.projects).length > 0) {
       console.log('\n  Projects:');
-      for (const [path, stats] of Object.entries(status.projects)) {
-        console.log(`    ${path}:`);
-        console.log(`      Events: ${stats.events_processed}, Memories: ${stats.memories_extracted}`);
+      for (const [projectPath, stats] of Object.entries(status.projects)) {
+        console.log(`    ${projectPath}:`);
+        console.log(`      Sessions: ${stats.events_processed}, Knowledge updates: ${stats.memories_extracted}`);
         if (stats.last_activity) {
           console.log(`      Last activity: ${stats.last_activity}`);
         }
@@ -917,46 +854,9 @@ async function showStatus(): Promise<void> {
   }
 }
 
-async function runManualDecay(): Promise<void> {
-  const statusPath = getGlobalStatusPath();
-
-  // Read current status to get project list
-  let projects: string[] = [];
-  try {
-    const content = await fs.readFile(statusPath, 'utf-8');
-    const status = JSON.parse(content) as DaemonStatus;
-    if (status.projects) {
-      projects = Object.keys(status.projects);
-    }
-  } catch {
-    console.log('No status file found. Please specify a project directory.');
-    return;
-  }
-
-  if (projects.length === 0) {
-    console.log('No projects found in daemon status.');
-    return;
-  }
-
-  console.log('Running decay for known projects...');
-  for (const projectPath of projects) {
-    const memoryDir = getProjectMemoryDir(projectPath);
-    console.log(`\n  ${projectPath}:`);
-
-    const result = await runDecay(memoryDir);
-    if (result.ok) {
-      console.log(`    Daily: moved=${result.value.daily.moved}, filtered=${result.value.daily.filtered}`);
-      console.log(`    Weekly: moved=${result.value.weekly.moved}, filtered=${result.value.weekly.filtered}`);
-      console.log(`    Monthly: archived=${result.value.monthly.archived}`);
-    } else {
-      console.error(`    Failed: ${result.error.message}`);
-    }
-  }
-}
-
 // Determine command - handle both direct invocation and via cli.js
 const args = process.argv.slice(2);
-const command = args.find(arg => ['start', 'status', 'decay'].includes(arg)) ?? (args.length === 0 ? undefined : 'start');
+const command = args.find(arg => ['start', 'status'].includes(arg)) ?? (args.length === 0 ? undefined : 'start');
 
 switch (command) {
   case 'start':
@@ -971,7 +871,8 @@ switch (command) {
     showStatus();
     break;
 
-  case 'decay':
-    runManualDecay();
-    break;
+  default:
+    console.error(`Unknown command: ${command}`);
+    console.log('Usage: memoryd [start|status]');
+    process.exit(1);
 }

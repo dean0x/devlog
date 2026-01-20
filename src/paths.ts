@@ -34,6 +34,7 @@ const GLOBAL_DIR_NAME = '.devlog';
 const CONFIG_FILE = 'config.json';
 const STATUS_FILE = 'daemon.status';
 const QUEUE_DIR = 'queue';
+const PENDING_PROJECTS_FILE = 'pending-projects.json';
 
 /**
  * Get the global devlog directory (~/.devlog/)
@@ -86,6 +87,79 @@ export async function isValidProjectPath(path: string): Promise<boolean> {
     return stat.isDirectory();
   } catch {
     return false;
+  }
+}
+
+// ============================================================================
+// Pending Projects Registry (for daemon discovery)
+// ============================================================================
+
+/**
+ * Get the pending projects file path (~/.devlog/pending-projects.json)
+ */
+export function getPendingProjectsPath(): string {
+  return join(getGlobalDir(), PENDING_PROJECTS_FILE);
+}
+
+/**
+ * Register a project for daemon discovery
+ *
+ * Called by hooks to notify daemon about new projects.
+ */
+export async function registerProject(projectPath: string): Promise<Result<void, StorageError>> {
+  const filePath = getPendingProjectsPath();
+
+  try {
+    // Read existing projects
+    let projects: string[] = [];
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      projects = JSON.parse(content) as string[];
+    } catch {
+      // File doesn't exist yet
+    }
+
+    // Add if not already present
+    if (!projects.includes(projectPath)) {
+      projects.push(projectPath);
+      await fs.writeFile(filePath, JSON.stringify(projects, null, 2), 'utf-8');
+    }
+
+    return Ok(undefined);
+  } catch (error) {
+    return Err({
+      type: 'write_error',
+      message: `Failed to register project: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      path: filePath,
+    });
+  }
+}
+
+/**
+ * Get and clear pending projects
+ *
+ * Called by daemon to discover new projects.
+ */
+export async function consumePendingProjects(): Promise<Result<string[], StorageError>> {
+  const filePath = getPendingProjectsPath();
+
+  try {
+    const content = await fs.readFile(filePath, 'utf-8');
+    const projects = JSON.parse(content) as string[];
+
+    // Clear the file
+    await fs.writeFile(filePath, '[]', 'utf-8');
+
+    return Ok(projects);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return Ok([]);
+    }
+    return Err({
+      type: 'read_error',
+      message: `Failed to read pending projects: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      path: filePath,
+    });
   }
 }
 
@@ -197,34 +271,15 @@ export async function writeGlobalConfig(config: GlobalConfig): Promise<Result<vo
 export async function initProjectMemory(projectPath: string): Promise<Result<void, StorageError>> {
   const memoryDir = getProjectMemoryDir(projectPath);
 
+  // New directory structure: knowledge/ and working/
   const dirs = [
-    join(memoryDir, 'short'),
-    join(memoryDir, 'short', 'archive'),
-    join(memoryDir, 'long'),
+    join(memoryDir, 'knowledge'),
+    join(memoryDir, 'working'),
   ];
 
   try {
     for (const dir of dirs) {
       await fs.mkdir(dir, { recursive: true });
-    }
-
-    // Create initial memory files if they don't exist
-    const today = new Date().toISOString().split('T')[0];
-    const shortDir = join(memoryDir, 'short');
-
-    for (const file of ['today.md', 'this-week.md', 'this-month.md']) {
-      const filePath = join(shortDir, file);
-      try {
-        await fs.access(filePath);
-      } catch {
-        await fs.writeFile(filePath, `---
-date: ${today}
-entries: 0
-last_updated: ${new Date().toISOString()}
----
-# ${file.replace('.md', '').replace(/-/g, ' ')} - ${today}
-`);
-      }
     }
 
     return Ok(undefined);
@@ -238,13 +293,26 @@ last_updated: ${new Date().toISOString()}
 }
 
 /**
+ * Clean up legacy memory structure (short/, long/, candidates.json)
+ * Called silently during first session with new system
+ */
+export async function cleanupLegacyMemory(projectPath: string): Promise<void> {
+  const memoryDir = getProjectMemoryDir(projectPath);
+
+  // Silently remove old directories and files
+  await fs.rm(join(memoryDir, 'short'), { recursive: true, force: true }).catch(() => {});
+  await fs.rm(join(memoryDir, 'long'), { recursive: true, force: true }).catch(() => {});
+  await fs.rm(join(memoryDir, 'candidates.json'), { force: true }).catch(() => {});
+}
+
+/**
  * Check if a project has memory initialized
  */
 export async function isProjectMemoryInitialized(projectPath: string): Promise<boolean> {
   const memoryDir = getProjectMemoryDir(projectPath);
 
   try {
-    await fs.access(join(memoryDir, 'short'));
+    await fs.access(join(memoryDir, 'knowledge'));
     return true;
   } catch {
     return false;
