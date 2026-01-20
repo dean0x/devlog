@@ -153,7 +153,7 @@ async function runOllamaExtraction(
       ],
       options: {
         temperature: 0.3,
-        num_predict: 1000,
+        // No num_predict limit - local Ollama has no cost, let model complete naturally
       },
     });
 
@@ -225,12 +225,11 @@ const SESSION_CONSOLIDATION_PROMPT = `You are a developer's knowledge consolidat
 
 ## SESSION TO CONSOLIDATE
 
-Session ID: {session_id}
 Project: {project_path}
 Duration: {turn_count} turns
 Files touched: {files_touched}
 
-### Signals from this session:
+### Session turns (raw context for your analysis):
 
 {signals}
 
@@ -267,6 +266,13 @@ Output JSON:
   "reasoning": "Why this decision?"
 }
 
+## CRITICAL CONSTRAINTS
+
+- **category** is REQUIRED for create_section, extend_section, add_example
+- **section_id** must be EXACTLY one of the IDs listed above (if extending)
+- If you cannot find a matching section_id, use create_section or skip instead
+- Valid categories are: conventions, architecture, decisions, gotchas
+
 ## QUALITY GUIDELINES
 
 ### GOOD knowledge (worth capturing):
@@ -278,7 +284,7 @@ Output JSON:
 - "Made some code changes" (too vague)
 - "Fixed a bug" (no insight about what/why)
 - "User asked a question" (just conversation)
-- Session with only file_touched signals and no decisions
+- Sessions with only file edits and no meaningful decisions or insights
 
 ## RULES
 - PREFER extending/confirming existing knowledge over creating new
@@ -295,6 +301,9 @@ OUTPUT ONLY VALID JSON:`;
 
 /**
  * Format existing knowledge for context
+ *
+ * ARCHITECTURE: Explicitly lists valid section IDs to constrain LLM choices
+ * Pattern: Reduce hallucination by making valid options explicit
  */
 function formatExistingKnowledge(
   knowledge: Map<KnowledgeCategory, { sections: readonly KnowledgeSection[] }>
@@ -305,6 +314,8 @@ function formatExistingKnowledge(
     if (file.sections.length === 0) continue;
 
     parts.push(`### ${category.toUpperCase()}`);
+    parts.push(`Valid section IDs for ${category}: ${file.sections.map(s => s.id).join(', ')}`);
+    parts.push('');
     for (const section of file.sections.slice(0, 10)) {
       parts.push(`[${section.id}] ${section.title}`);
       parts.push(`  ${section.content.slice(0, 150)}...`);
@@ -321,16 +332,32 @@ function formatExistingKnowledge(
  */
 function formatSessionSignals(signals: readonly SessionSignal[]): string {
   if (signals.length === 0) {
-    return '(No signals recorded)';
+    return '(No turns recorded)';
   }
 
-  return signals.map(signal => {
-    let line = `- [${signal.signal_type}] ${signal.content}`;
-    if (signal.files && signal.files.length > 0) {
-      line += `\n  Files: ${signal.files.slice(0, 3).join(', ')}`;
+  // Group by type for cleaner output
+  const fileTouched = signals.filter(s => s.signal_type === 'file_touched');
+  const turnContexts = signals.filter(s => s.signal_type === 'turn_context');
+
+  const parts: string[] = [];
+
+  // Show turn contexts (the actual conversation)
+  for (const signal of turnContexts) {
+    parts.push(`### Turn ${signal.turn_number}`);
+    parts.push(signal.content);
+    parts.push('');
+  }
+
+  // Summarize files at the end
+  if (fileTouched.length > 0) {
+    const allFiles = fileTouched.flatMap(s => s.files ?? []);
+    const uniqueFiles = [...new Set(allFiles)];
+    if (uniqueFiles.length > 0) {
+      parts.push(`### Files modified: ${uniqueFiles.slice(0, 10).join(', ')}`);
     }
-    return line;
-  }).join('\n');
+  }
+
+  return parts.join('\n');
 }
 
 /**
@@ -342,7 +369,6 @@ function buildSessionConsolidationPrompt(
 ): string {
   return SESSION_CONSOLIDATION_PROMPT
     .replace('{existing_knowledge}', formatExistingKnowledge(existingKnowledge))
-    .replace('{session_id}', session.session_id)
     .replace('{project_path}', session.project_path)
     .replace('{turn_count}', String(session.turn_count))
     .replace('{files_touched}', session.files_touched_all.join(', ') || '(none)')
@@ -435,50 +461,96 @@ function parseSessionConsolidationResponse(
 }
 
 // ============================================================================
+// Decision Validation
+// ============================================================================
+
+interface ValidationResult {
+  readonly valid: boolean;
+  readonly error?: string;
+}
+
+/**
+ * Validate a consolidation decision against existing knowledge
+ *
+ * ARCHITECTURE: Validates LLM output before applying
+ * Pattern: Catch invalid decisions early, enable retry with feedback
+ */
+function validateDecision(
+  decision: SessionConsolidationDecision,
+  existingKnowledge: Map<KnowledgeCategory, { sections: readonly KnowledgeSection[] }>
+): ValidationResult {
+  // Actions that don't need validation
+  if (decision.action === 'skip' || decision.action === 'confirm_pattern' || decision.action === 'flag_contradiction') {
+    return { valid: true };
+  }
+
+  // Require category for content-modifying actions
+  if (!decision.category) {
+    return {
+      valid: false,
+      error: `Action "${decision.action}" requires a valid category (conventions|architecture|decisions|gotchas)`,
+    };
+  }
+
+  // create_section needs new_section
+  if (decision.action === 'create_section') {
+    if (!decision.new_section?.title || !decision.new_section?.content) {
+      return {
+        valid: false,
+        error: 'create_section requires new_section with title and content',
+      };
+    }
+    return { valid: true };
+  }
+
+  // extend_section and add_example need section_id that exists
+  if (decision.action === 'extend_section' || decision.action === 'add_example') {
+    if (!decision.section_id) {
+      return {
+        valid: false,
+        error: `${decision.action} requires a valid section_id`,
+      };
+    }
+
+    const categoryFile = existingKnowledge.get(decision.category);
+    const validIds = categoryFile?.sections.map(s => s.id) ?? [];
+
+    if (!validIds.includes(decision.section_id)) {
+      return {
+        valid: false,
+        error: `section_id "${decision.section_id}" not found in ${decision.category}. Valid IDs: ${validIds.join(', ') || '(none)'}`,
+      };
+    }
+
+    if (decision.action === 'extend_section' && !decision.extension?.additional_content) {
+      return {
+        valid: false,
+        error: 'extend_section requires extension.additional_content',
+      };
+    }
+
+    return { valid: true };
+  }
+
+  return { valid: true };
+}
+
+// ============================================================================
 // Fallback Extraction
 // ============================================================================
 
 /**
  * Fallback consolidation when LLM is unavailable
+ *
+ * Since we no longer do regex-based signal extraction, we can't make
+ * meaningful decisions without the LLM. Just skip.
  */
 function fallbackSessionConsolidation(
-  session: SessionAccumulator
+  _session: SessionAccumulator
 ): SessionConsolidationDecision {
-  // Simple heuristic: if we have decisions, create a section
-  const decisions = session.signals.filter(s => s.signal_type === 'decision_made');
-  const problems = session.signals.filter(s => s.signal_type === 'problem_discovered');
-
-  if (decisions.length > 0) {
-    const firstDecision = decisions[0];
-    return {
-      action: 'create_section',
-      category: 'decisions',
-      new_section: {
-        title: firstDecision?.content.slice(0, 80) ?? 'Decision from session',
-        content: decisions.map(d => d.content).join('\n\n'),
-        tags: ['auto-extracted'],
-      },
-      reasoning: 'Fallback: Found decision signals',
-    };
-  }
-
-  if (problems.length > 0) {
-    const firstProblem = problems[0];
-    return {
-      action: 'create_section',
-      category: 'gotchas',
-      new_section: {
-        title: firstProblem?.content.slice(0, 80) ?? 'Issue from session',
-        content: problems.map(p => p.content).join('\n\n'),
-        tags: ['auto-extracted'],
-      },
-      reasoning: 'Fallback: Found problem signals',
-    };
-  }
-
   return {
     action: 'skip',
-    reasoning: 'Fallback: No valuable signals found',
+    reasoning: 'Fallback: LLM unavailable, cannot analyze raw turn context',
   };
 }
 
@@ -489,17 +561,23 @@ function fallbackSessionConsolidation(
 /**
  * Extract knowledge from a session using LLM
  *
- * ARCHITECTURE: Session-level extraction for knowledge consolidation
- * Pattern: Load context, run LLM, return consolidation decision
+ * ARCHITECTURE: Session-level extraction with validation and retry
+ * Pattern: Load context, run LLM, validate, retry with feedback if invalid
+ *
+ * Retry behavior:
+ * - If LLM response fails validation, retry with error feedback appended
+ * - Max 2 attempts to avoid infinite loops
+ * - Force skip after exhausting retries
  */
 export async function extractSessionKnowledge(
   session: SessionAccumulator,
   knowledgeStoreConfig: KnowledgeStoreConfig,
-  extractorConfig: ExtractorConfig
+  extractorConfig: ExtractorConfig,
+  maxRetries: number = 2
 ): Promise<Result<SessionConsolidationDecision, DaemonError>> {
   return withExtractionLock(async () => {
     debugLog('Starting session consolidation', {
-      session_id: session.session_id,
+      project: session.project_path,
       signals_count: session.signals.length,
       files_count: session.files_touched_all.length,
     });
@@ -514,29 +592,55 @@ export async function extractSessionKnowledge(
       categories: existingKnowledge.size,
     });
 
-    // 2. Build prompt
-    const prompt = buildSessionConsolidationPrompt(session, existingKnowledge);
+    // 2. Build initial prompt
+    let prompt = buildSessionConsolidationPrompt(session, existingKnowledge);
+    let lastError: string | undefined;
 
-    // 3. Run LLM
-    const ollamaResult = await runOllamaExtraction(prompt, extractorConfig);
-    if (!ollamaResult.ok) {
-      debugLog('Ollama failed, using fallback', { error: ollamaResult.error.message });
-      return Ok(fallbackSessionConsolidation(session));
+    // 3. Try up to maxRetries times
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      // If retrying, append error feedback to prompt
+      if (attempt > 0 && lastError) {
+        prompt = `${prompt}\n\n## CORRECTION NEEDED\nYour previous response had an error: ${lastError}\nPlease fix and output valid JSON:`;
+        debugLog('Retrying with feedback', { attempt, error: lastError });
+      }
+
+      // Call LLM
+      const ollamaResult = await runOllamaExtraction(prompt, extractorConfig);
+      if (!ollamaResult.ok) {
+        debugLog('Ollama failed, using fallback', { error: ollamaResult.error.message });
+        return Ok(fallbackSessionConsolidation(session));
+      }
+
+      // Parse response
+      const parseResult = parseSessionConsolidationResponse(ollamaResult.value);
+      if (!parseResult.ok) {
+        lastError = parseResult.error.message;
+        continue;
+      }
+
+      // Validate decision
+      const validation = validateDecision(parseResult.value, existingKnowledge);
+      if (!validation.valid) {
+        lastError = validation.error;
+        debugLog('Validation failed', { error: validation.error });
+        continue;
+      }
+
+      // Success!
+      debugLog('Session consolidation decision', {
+        action: parseResult.value.action,
+        category: parseResult.value.category,
+        attempts: attempt + 1,
+      });
+
+      return Ok(parseResult.value);
     }
 
-    // 4. Parse response
-    const parseResult = parseSessionConsolidationResponse(ollamaResult.value);
-    if (!parseResult.ok) {
-      debugLog('Parse failed, using fallback', { error: parseResult.error.message });
-      return Ok(fallbackSessionConsolidation(session));
-    }
-
-    debugLog('Session consolidation decision', {
-      action: parseResult.value.action,
-      category: parseResult.value.category,
-      reasoning: parseResult.value.reasoning,
+    // All retries exhausted - force skip
+    debugLog('Max retries reached, forcing skip', { lastError });
+    return Ok({
+      action: 'skip',
+      reasoning: `Forced skip after ${maxRetries} failed attempts. Last error: ${lastError}`,
     });
-
-    return Ok(parseResult.value);
   });
 }
