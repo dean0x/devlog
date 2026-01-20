@@ -9,8 +9,8 @@
  */
 
 import { promises as fs, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { enqueueEvent, initQueue } from '../storage/queue.js';
+import { tmpdir } from 'node:os';
+import { resolve, join } from 'node:path';
 import {
   initSessionStore,
   appendSignalAndPersist,
@@ -18,15 +18,14 @@ import {
   type SessionStoreConfig,
 } from '../storage/session-store.js';
 import {
-  getGlobalQueueDir,
   getProjectMemoryDir,
   initGlobalDirs,
   isGlobalInitialized,
+  cleanupLegacyMemory,
+  registerProject,
 } from '../paths.js';
-import { readSessionConfig } from '../paths.js';
+import { markCatchUpDirty } from '../catch-up/precomputed-store.js';
 import type { Result } from '../types/index.js';
-import type { SessionConfig } from '../types/session.js';
-import { DEFAULT_SESSION_CONFIG } from '../types/session.js';
 
 // ============================================================================
 // Extraction Detection - Prevents hook feedback loop
@@ -36,7 +35,7 @@ import { DEFAULT_SESSION_CONFIG } from '../types/session.js';
  * Marker file created by daemon during extraction.
  * Must match EXTRACTION_MARKER in extractor.ts
  */
-const EXTRACTION_MARKER = '/tmp/devlog-extraction-active';
+const EXTRACTION_MARKER = join(tmpdir(), 'devlog-extraction-active');
 
 /**
  * Check if daemon extraction is in progress
@@ -96,7 +95,7 @@ async function readStdin(): Promise<string> {
 }
 
 function getBufferFilePath(sessionId: string): string {
-  return `/tmp/devlog-files-${sessionId}`;
+  return join(tmpdir(), `devlog-files-${sessionId}`);
 }
 
 async function ensureGlobalInit(): Promise<void> {
@@ -322,90 +321,48 @@ export async function handleStop(): Promise<Result<void, Error>> {
     // Auto-initialize global dirs if needed
     await ensureGlobalInit();
 
-    // Read session config to determine processing mode
-    const configResult = await readSessionConfig();
-    const sessionConfig: SessionConfig = configResult.ok
-      ? configResult.value
-      : DEFAULT_SESSION_CONFIG;
+    const memoryDir = getProjectMemoryDir(resolve(projectPath));
 
-    // Process based on enabled modes
-    const results: string[] = [];
+    // Clean up legacy memory structure on first run (silent)
+    await cleanupLegacyMemory(resolve(projectPath));
 
-    // New session-based accumulation (if enabled)
-    if (sessionConfig.session_consolidation) {
-      const memoryDir = getProjectMemoryDir(resolve(projectPath));
-      const sessionStoreConfig: SessionStoreConfig = { memoryDir };
+    const sessionStoreConfig: SessionStoreConfig = { memoryDir };
 
-      // Initialize session store
-      await initSessionStore(sessionStoreConfig);
+    // Initialize session store
+    await initSessionStore(sessionStoreConfig);
 
-      // Get turn number from session (we estimate based on signal count)
-      // In practice, this is incremented each time we add signals
-      const turnNumber = Date.now(); // Use timestamp as unique turn identifier
+    // Get turn number from session (we estimate based on signal count)
+    // In practice, this is incremented each time we add signals
+    const turnNumber = Date.now(); // Use timestamp as unique turn identifier
 
-      // Extract signals from turn
-      const signals = extractSignalsFromTurn(
-        turnNumber,
-        turnData.user_prompt,
-        turnData.assistant_response,
-        filesTouched
+    // Extract signals from turn
+    const signals = extractSignalsFromTurn(
+      turnNumber,
+      turnData.user_prompt,
+      turnData.assistant_response,
+      filesTouched
+    );
+
+    // Append signals to session buffer
+    for (const signal of signals) {
+      const appendResult = await appendSignalAndPersist(
+        sessionStoreConfig,
+        sessionId,
+        resolve(projectPath),
+        signal
       );
 
-      // Append signals to session buffer
-      for (const signal of signals) {
-        const appendResult = await appendSignalAndPersist(
-          sessionStoreConfig,
-          sessionId,
-          resolve(projectPath),
-          signal
-        );
-
-        if (!appendResult.ok) {
-          console.warn(`Failed to append signal: ${appendResult.error.message}`);
-        }
+      if (!appendResult.ok) {
+        console.warn(`Failed to append signal: ${appendResult.error.message}`);
       }
-
-      results.push(`Accumulated ${signals.length} signals`);
     }
 
-    // Legacy per-turn processing (if enabled)
-    if (sessionConfig.legacy_turn_processing) {
-      // Initialize queue
-      const queueDir = getGlobalQueueDir();
-      const initResult = await initQueue({ baseDir: queueDir });
-      if (!initResult.ok) {
-        return {
-          ok: false,
-          error: new Error(`Failed to initialize queue: ${initResult.error.message}`),
-        };
-      }
-
-      // Enqueue turn_complete event
-      const result = await enqueueEvent(
-        {
-          event_type: 'turn_complete',
-          session_id: sessionId,
-          project_path: resolve(projectPath),
-          user_prompt: turnData.user_prompt,
-          assistant_response: turnData.assistant_response,
-          files_touched: filesTouched,
-        },
-        { baseDir: queueDir }
-      );
-
-      if (!result.ok) {
-        return {
-          ok: false,
-          error: new Error(`Failed to enqueue event: ${result.error.message}`),
-        };
-      }
-
-      results.push(`Enqueued event: ${result.value}`);
-    }
-
-    // Log success (visible in Claude Code hook output)
-    if (results.length > 0) {
-      console.log(results.join(', '));
+    // Mark catch-up as dirty so daemon will recompute summary
+    if (signals.length > 0) {
+      await markCatchUpDirty(memoryDir);
+      // Register project with daemon for discovery
+      await registerProject(projectPath);
+      console.log(`Accumulated ${signals.length} signals`);
     }
 
     return { ok: true, value: undefined };
