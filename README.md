@@ -1,10 +1,10 @@
 # devlog
 
-A background memory extraction system for Claude Code that captures, stores, and manages memories from your development sessions.
+A background knowledge extraction system for Claude Code that captures, consolidates, and manages project knowledge from your development sessions.
 
 ## Overview
 
-Devlog monitors your Claude Code sessions via hooks and extracts meaningful memories using a local LLM (Ollama). Memories are organized into short-term and long-term storage with automatic decay and promotion mechanisms.
+Devlog monitors your Claude Code sessions via hooks and extracts meaningful knowledge using a local LLM (Ollama). Knowledge is organized into categories (conventions, architecture, decisions, gotchas) and consolidated over time.
 
 **Setup once, works everywhere** - The global daemon architecture means you configure devlog once and it automatically works across all your projects.
 
@@ -19,28 +19,32 @@ Devlog monitors your Claude Code sessions via hooks and extracts meaningful memo
             ┌────────────────┼────────────────┐
             │    Claude Code Hooks            │
             │  ┌──────────┐  ┌─────────────┐  │
-            │  │PostTool  │  │SessionEnd   │  │
-            │  │Use       │  │             │  │
+            │  │PostTool  │  │Stop         │  │
+            │  │Use       │  │(session end)│  │
             │  └────┬─────┘  └──────┬──────┘  │
             └───────┼───────────────┼─────────┘
                     │               │
                     ▼               ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│             GLOBAL EVENT QUEUE (~/.devlog/queue/)                         │
-│         pending/*.json → processing → completed                           │
-│         Events include project_path for routing                           │
+│                    SESSION SIGNAL ACCUMULATION                            │
+│  Hooks extract signals from each turn:                                    │
+│  - Files touched (Edit/Write tools)                                       │
+│  - Decisions made (pattern matching)                                      │
+│  - Problems discovered                                                    │
+│  - Goals stated                                                           │
+│  Signals stored in: {project}/.memory/working/session-*.json              │
 └───────────────────────────────────┬───────────────────────────────────────┘
                                     │
                                     ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                    GLOBAL MEMORY DAEMON (memoryd)                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ Anthropic Proxy ──► Ollama (llama3.2) ──► Memory Extraction        │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-│  - Watches global queue                                                   │
-│  - Routes memories to correct project based on project_path               │
-│  - Auto-initializes project .memory/ directories                          │
-│  - Manages memory decay/compaction per project                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ Session Consolidation ──► Ollama (llama3.2) ──► Knowledge Files    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│  - Discovers registered projects                                          │
+│  - Monitors session staleness (idle timeout)                              │
+│  - Consolidates sessions to knowledge when complete                       │
+│  - Pre-computes catch-up summaries (instant queries!)                     │
 └───────────────────────────────────┬───────────────────────────────────────┘
                                     │
           ┌─────────────────────────┼─────────────────────────┐
@@ -48,9 +52,13 @@ Devlog monitors your Claude Code sessions via hooks and extracts meaningful memo
 ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
 │ Project A       │       │ Project B       │       │ Project C       │
 │ /.memory/       │       │ /.memory/       │       │ /.memory/       │
-│ ├── short/      │       │ ├── short/      │       │ ├── short/      │
-│ │   └── today.md│       │ │   └── today.md│       │ │   └── today.md│
-│ └── long/       │       │ └── long/       │       │ └── long/       │
+│ ├── knowledge/  │       │ ├── knowledge/  │       │ ├── knowledge/  │
+│ │   ├── conv... │       │ │   ├── conv... │       │ │   ├── conv... │
+│ │   ├── arch... │       │ │   ├── arch... │       │ │   ├── arch... │
+│ │   ├── deci... │       │ │   ├── deci... │       │ │   ├── deci... │
+│ │   └── gotc... │       │ │   └── gotc... │       │ │   └── gotc... │
+│ ├── working/    │       │ ├── working/    │       │ ├── working/    │
+│ └── index.md    │       │ └── index.md    │       │ └── index.md    │
 └─────────────────┘       └─────────────────┘       └─────────────────┘
 ```
 
@@ -60,176 +68,81 @@ Devlog monitors your Claude Code sessions via hooks and extracts meaningful memo
 - [Ollama](https://ollama.ai/) running locally with `llama3.2` model
 - Claude Code CLI installed
 
-## Quick Start (One-Time Global Setup)
+## Quick Start
 
 ```bash
-# 1. Build and install globally
-cd /path/to/devlog
-npm install
-npm run build
-npm link
+# 1. Install devlog
+npm install -g devlog
+# Or build from source:
+cd /path/to/devlog && npm install && npm run build && npm link
 
-# 2. Initialize global devlog
-devlog init
-# Creates ~/.devlog/ with queue directories and config
+# 2. Run setup (creates config, registers hooks)
+devlog setup --yes
 
-# 3. Configure Claude Code hooks
-devlog hooks
-# Copy the output to ~/.claude/settings.json
-
-# 4. Start the proxy (in background or separate terminal)
-devlog proxy &
-
-# 5. Start the global daemon (in background or separate terminal)
+# 3. Start the daemon
 devlog daemon &
 
-# That's it! Now use Claude Code in any project:
+# 4. Use Claude Code normally - knowledge is captured automatically!
 cd /any/project
 claude
-# Memories are automatically captured to /any/project/.memory/
 ```
 
-## Using Devlog
+## CLI Commands
 
-Once set up, devlog works automatically in any project directory:
-
-```bash
-# Use Claude Code normally in any project
-cd /project-a
-claude   # Memories auto-saved to /project-a/.memory/
-
-cd /project-b
-claude   # Memories auto-saved to /project-b/.memory/
-
-# View captured memories for current project
-devlog read today
-devlog read this-week
-devlog read this-month
-
-# Check global daemon status
-devlog status
-```
+| Command | Description |
+|---------|-------------|
+| `devlog setup [--yes]` | Initialize devlog (creates ~/.devlog, registers hooks) |
+| `devlog daemon` | Start the background memory daemon |
+| `devlog status` | Show daemon status and registered projects |
+| `devlog catch-up` | Get instant summary of recent session activity |
+| `devlog knowledge` | Show consolidated knowledge for current project |
+| `devlog hooks` | Output hook configuration for manual setup |
 
 ## Directory Structure
 
-### Global (setup once)
+### Global (created by setup)
 
 ```
 ~/.devlog/
 ├── config.json           # Global configuration
-├── daemon.status         # Daemon status (running, events processed, etc.)
-└── queue/
-    ├── pending/          # Events from all projects
-    ├── processing/       # Events being processed
-    └── failed/           # Failed events
+├── daemon.pid            # Daemon process ID
+└── projects.json         # Registered project paths
 ```
 
 ### Per-Project (auto-created)
 
 ```
 /your/project/.memory/
-├── short/
-│   ├── today.md          # Today's memories
-│   ├── this-week.md      # This week's condensed
-│   ├── this-month.md     # Monthly summaries
-│   └── archive/          # Historical
-├── long/
-│   ├── conventions.md    # Auto-promoted patterns
-│   ├── architecture.md
-│   └── rules-of-thumb.md
-└── candidates.json       # Promotion candidates
+├── knowledge/            # Consolidated knowledge (markdown)
+│   ├── conventions.md    # How things are done
+│   ├── architecture.md   # Structural decisions
+│   ├── decisions.md      # Explicit choices with rationale
+│   └── gotchas.md        # Warnings and edge cases
+├── working/              # Ephemeral session data
+│   ├── session-*.json    # Active session signals
+│   ├── catch-up-state.json
+│   └── catch-up-summary.json
+└── index.md              # Auto-generated table of contents
 ```
-
-## CLI Reference
-
-| Command | Purpose |
-|---------|---------|
-| `devlog init` | Initialize global ~/.devlog directory (one-time) |
-| `devlog proxy` | Start Ollama proxy (port 8082) |
-| `devlog daemon` | Start global memory daemon |
-| `devlog status` | Check daemon status + current project info |
-| `devlog read today` | View today's memories for current project |
-| `devlog read this-week` | View this week's memories |
-| `devlog read this-month` | View this month's memories |
-| `devlog hooks` | Get hook config for settings.json |
-| `devlog config` | Show current configuration |
-
-## Memory Storage
-
-### Short-Term Memory
-
-Located in `{project}/.memory/short/`:
-
-- `today.md` - Full detail from today's sessions
-- `this-week.md` - Condensed high-confidence memories
-- `this-month.md` - Monthly summaries
-- `archive/` - Historical archives
-
-Example entry:
-
-```markdown
-## 14:32 - Refactored TaskManager to event-driven
-
-**Decision**: Switched from direct repository access to EventBus pattern
-**Rationale**: Better testability and extensibility
-**Files**: src/services/task-manager.ts, src/core/event-bus.ts
-**Confidence**: 0.92
-```
-
-### Long-Term Memory
-
-Located in `{project}/.memory/long/`:
-
-- `conventions.md` - Coding conventions observed
-- `architecture.md` - Architecture decisions
-- `rules-of-thumb.md` - General patterns
-
-These are automatically populated when patterns are observed 3+ times with high confidence.
-
-## Decay Algorithm
-
-Memories are automatically compacted over time:
-
-| Period | Action |
-|--------|--------|
-| Daily (2 AM) | Yesterday's memories → this-week (filter confidence < 0.7) |
-| Weekly (Monday) | Last week → this-month (keep decisions/patterns only) |
-| Monthly (1st) | Previous month → archive (generate summary) |
 
 ## Configuration
-
-### Global Config File
-
-Edit `~/.devlog/config.json`:
-
-```json
-{
-  "ollama_base_url": "http://localhost:11434",
-  "ollama_model": "llama3.2",
-  "proxy_port": 8082
-}
-```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_PORT` | from config or 8082 | Port for the Anthropic proxy |
-| `OLLAMA_BASE_URL` | from config or http://localhost:11434 | Ollama server URL |
-| `OLLAMA_MODEL` | from config or llama3.2 | Ollama model to use |
-| `DEVLOG_HOME` | ~/.devlog | Override global directory |
-| `DEVLOG_QUEUE_DIR` | ~/.devlog/queue | Override queue directory |
-| `BATCH_SIZE` | 5 | Events to process per batch |
-| `POLL_INTERVAL` | 5000 | Queue poll interval (ms) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | `llama3.2` | Ollama model for extraction |
+| `DEVLOG_HOME` | `~/.devlog` | Override global directory |
+| `DEVLOG_DEBUG` | unset | Set to `1` for debug logging |
 
-### Docker Configuration
+### Docker / Container Setup
 
-When running inside a Docker container (e.g., Claude Code in Docker), `localhost` refers to the container, not your host machine where Ollama runs.
+When running Claude Code inside a container, `localhost` refers to the container, not your host machine where Ollama runs.
 
 **Docker Desktop (Mac/Windows):**
 ```bash
 export OLLAMA_BASE_URL=http://host.docker.internal:11434
-devlog proxy
 ```
 
 **Linux Docker:**
@@ -241,110 +154,103 @@ docker run --add-host=host.docker.internal:host-gateway ...
 export OLLAMA_BASE_URL=http://192.168.1.x:11434
 ```
 
-**Ollama also in Docker:**
+**Ollama also in Docker (same network):**
 ```bash
-# Use Docker networking (same network)
 export OLLAMA_BASE_URL=http://ollama:11434
 ```
 
-## Verification
+## How It Works
 
-### Test the Proxy
+### Signal Extraction
 
-```bash
-curl -X POST http://localhost:8082/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 100
-  }'
-```
+The `PostToolUse` hook tracks files modified during a session. The `Stop` hook (triggered when Claude pauses) extracts signals from the conversation:
 
-### Test Hooks
+- **file_touched**: Files edited or created
+- **decision_made**: Choices with rationale (detected via patterns)
+- **problem_discovered**: Issues identified in conversation
+- **goal_stated**: User intentions
 
-```bash
-# Run Claude Code session in any project
-cd /any/project
-claude -p "Create a file test.txt"
+### Session Consolidation
 
-# Check global queue
-ls ~/.devlog/queue/pending/
-```
+When a session becomes stale (no activity for 5 minutes), the daemon:
 
-### Check Memories
+1. Loads existing project knowledge for context
+2. Analyzes accumulated signals
+3. Calls Ollama to determine the consolidation action:
+   - `create_section` - New knowledge
+   - `extend_section` - Add detail to existing
+   - `confirm_pattern` - Reinforce existing (increment observations)
+   - `skip` - No valuable knowledge
 
-```bash
-cd /any/project
-devlog read today
-```
+### Catch-Up Summaries
 
-### Check Status
-
-```bash
-devlog status
-# Shows global daemon status and current project info
-```
-
-## Programmatic Usage
-
-```typescript
-import {
-  createProxyApp,
-  initMemoryStore,
-  readShortTermMemory,
-  extractMemories,
-} from 'devlog';
-
-// Create proxy app
-const app = createProxyApp({
-  port: 8082,
-  ollamaBaseUrl: 'http://localhost:11434',
-  ollamaModel: 'llama3.2',
-  timeout: 120000,
-});
-
-// Read memories
-const result = await readShortTermMemory(
-  { baseDir: '/path/to/project/.memory' },
-  'today'
-);
-if (result.ok) {
-  console.log(result.value.memories);
-}
-```
+The daemon pre-computes summaries in the background. When you run `devlog catch-up`, results are instant because they're already computed. The dirty flag system ensures summaries stay fresh.
 
 ## Troubleshooting
 
-### Proxy not connecting to Ollama
+### Daemon not starting
 
-1. Ensure Ollama is running: `ollama serve`
-2. Check the model is available: `ollama list`
-3. Verify URL: `curl http://localhost:11434/api/tags`
+```bash
+# Check if already running
+devlog status
 
-### Events not appearing in queue
+# Check for stale PID file
+cat ~/.devlog/daemon.pid
+ps aux | grep memoryd
 
-1. Check hook paths in settings.json are absolute
-2. Verify hook scripts are executable: `chmod +x dist/hooks/*.sh`
-3. Run `devlog status` to see queue stats
+# Remove stale PID and restart
+rm ~/.devlog/daemon.pid
+devlog daemon
+```
 
-### Extraction returning empty memories
+### No knowledge being captured
 
-1. Ensure daemon is running: `devlog status`
-2. Check proxy is accessible
-3. Review daemon logs for errors
+1. Verify hooks are registered:
+   ```bash
+   cat ~/.claude/settings.json | grep devlog
+   ```
 
-### Project memories not appearing
+2. Check daemon is running:
+   ```bash
+   devlog status
+   ```
 
-1. Verify daemon is routing correctly: `devlog status` shows the project
-2. Check `{project}/.memory/` directory was auto-created
-3. Run `devlog read today` from the project directory
+3. Verify Ollama is accessible:
+   ```bash
+   curl http://localhost:11434/api/tags
+   ```
+
+### Catch-up returns empty
+
+- First run takes time to compute
+- Wait for session to be "stale" (5 min idle)
+- Check daemon logs for extraction errors
+
+### Docker: Ollama connection refused
+
+Set `OLLAMA_BASE_URL` to reach host machine:
+```bash
+export OLLAMA_BASE_URL=http://host.docker.internal:11434
+```
+
+## Known Limitations
+
+1. **Session ID**: Claude Code doesn't currently pass `CLAUDE_SESSION_ID` environment variable to hooks, so all sessions appear as "unknown". Knowledge is still captured correctly per-project.
+
+2. **Ollama Required**: LLM-based features (knowledge extraction, catch-up summaries) require Ollama running locally.
+
+3. **First Run Latency**: The initial catch-up query may be slow while the summary is being computed. Subsequent queries are instant.
+
+4. **Pattern Detection**: Signal extraction uses heuristic pattern matching. Not all decisions/problems will be detected automatically.
 
 ## Development
 
 ```bash
-# Run tests
-npm test
+# Install dependencies
+npm install
+
+# Build
+npm run build
 
 # Type check
 npm run typecheck
@@ -352,7 +258,13 @@ npm run typecheck
 # Lint
 npm run lint
 
-# Watch mode
-npm run dev:proxy
+# Run tests
+npm test
+
+# Watch mode for daemon development
 npm run dev:daemon
 ```
+
+## License
+
+MIT
