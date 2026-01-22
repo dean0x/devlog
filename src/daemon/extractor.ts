@@ -7,13 +7,15 @@
  * The extractor:
  * 1. Takes a session with accumulated signals
  * 2. Loads existing knowledge context
- * 3. Acquires extraction lock (only one Ollama call at a time)
+ * 3. Acquires per-project lock (allows parallel extraction across projects)
  * 4. Builds session consolidation prompt
  * 5. Calls Ollama directly via ollama-js
  * 6. Parses decision JSON (create, extend, confirm, or skip)
  */
 
 import { Ollama } from 'ollama';
+
+import { createDebugWriter } from './debug-writer.js';
 
 // ============================================================================
 // Debug Logging
@@ -54,27 +56,41 @@ export interface ExtractorConfig {
 }
 
 // ============================================================================
-// Extraction Lock - Ensures only one Ollama call at a time
+// Extraction Lock - Per-project mutex for Ollama calls
 // ============================================================================
 
 /**
- * ARCHITECTURE: Simple promise-based mutex for extraction
- * Pattern: Prevents resource contention when multiple sessions overlap
+ * ARCHITECTURE: Per-project promise-based mutex for extraction
+ * Pattern: Prevents resource contention within a project while allowing
+ * parallel extraction across different projects
  */
-let extractionLock: Promise<void> = Promise.resolve();
+const projectLocks = new Map<string, Promise<void>>();
 
-async function withExtractionLock<T>(fn: () => Promise<T>): Promise<T> {
-  const previousLock = extractionLock;
+async function withProjectLock<T>(
+  projectPath: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const currentLock = projectLocks.get(projectPath) ?? Promise.resolve();
+
   let releaseLock: () => void;
-  extractionLock = new Promise((resolve) => {
+  const newLock = new Promise<void>((resolve) => {
     releaseLock = resolve;
   });
 
-  await previousLock;
+  // Chain after current lock for this project
+  const execution = currentLock.then(fn);
+
+  // Set new lock before awaiting (other callers will queue behind it)
+  projectLocks.set(projectPath, newLock);
+
   try {
-    return await fn();
+    return await execution;
   } finally {
     releaseLock!();
+    // Clean up if this is still the current lock
+    if (projectLocks.get(projectPath) === newLock) {
+      projectLocks.delete(projectPath);
+    }
   }
 }
 
@@ -575,12 +591,21 @@ export async function extractSessionKnowledge(
   extractorConfig: ExtractorConfig,
   maxRetries: number = 2
 ): Promise<Result<SessionConsolidationDecision, DaemonError>> {
-  return withExtractionLock(async () => {
+  return withProjectLock(session.project_path, async () => {
     debugLog('Starting session consolidation', {
       project: session.project_path,
       signals_count: session.signals.length,
       files_count: session.files_touched_all.length,
     });
+
+    // Create debug writer (null if debug disabled)
+    const debugWriter = createDebugWriter({
+      memoryDir: knowledgeStoreConfig.memoryDir,
+      sessionId: session.session_id,
+    });
+
+    // Write input signals
+    await debugWriter?.writeSignals(session.signals);
 
     // 1. Load existing knowledge
     const knowledgeResult = await readAllKnowledge(knowledgeStoreConfig);
@@ -591,6 +616,9 @@ export async function extractSessionKnowledge(
     debugLog('Loaded existing knowledge', {
       categories: existingKnowledge.size,
     });
+
+    // Write existing knowledge context
+    await debugWriter?.writeExistingKnowledge(existingKnowledge);
 
     // 2. Build initial prompt
     let prompt = buildSessionConsolidationPrompt(session, existingKnowledge);
@@ -604,22 +632,47 @@ export async function extractSessionKnowledge(
         debugLog('Retrying with feedback', { attempt, error: lastError });
       }
 
+      // Write prompt before LLM call
+      await debugWriter?.writePrompt(prompt, attempt);
+
       // Call LLM
       const ollamaResult = await runOllamaExtraction(prompt, extractorConfig);
       if (!ollamaResult.ok) {
         debugLog('Ollama failed, using fallback', { error: ollamaResult.error.message });
+        // Write failed response info
+        await debugWriter?.writeRawResponse(`ERROR: ${ollamaResult.error.message}`, attempt);
         return Ok(fallbackSessionConsolidation(session));
       }
+
+      // Write raw response
+      await debugWriter?.writeRawResponse(ollamaResult.value, attempt);
 
       // Parse response
       const parseResult = parseSessionConsolidationResponse(ollamaResult.value);
       if (!parseResult.ok) {
         lastError = parseResult.error.message;
+        // Write parse failure as validation info
+        await debugWriter?.writeValidation({
+          valid: false,
+          error: `Parse error: ${parseResult.error.message}`,
+          decision: { action: 'skip', reasoning: 'Parse failed' },
+        }, attempt);
         continue;
       }
 
+      // Write parsed decision
+      await debugWriter?.writeParsedDecision(parseResult.value, attempt);
+
       // Validate decision
       const validation = validateDecision(parseResult.value, existingKnowledge);
+
+      // Write validation result
+      await debugWriter?.writeValidation({
+        valid: validation.valid,
+        error: validation.error,
+        decision: parseResult.value,
+      }, attempt);
+
       if (!validation.valid) {
         lastError = validation.error;
         debugLog('Validation failed', { error: validation.error });
