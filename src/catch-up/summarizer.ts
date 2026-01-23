@@ -1,11 +1,12 @@
 /**
  * Catch-Up Summarizer
  *
- * ARCHITECTURE: Filter and format session signals for context restoration
- * Pattern: Reuse Gate 4 importance thresholds, output human-readable + JSON formats
+ * ARCHITECTURE: Format session data for context restoration
+ * Pattern: Pass raw turn context to LLM for analysis, provide fallback formatting
  *
- * This module filters raw session signals to extract only valuable information
- * for restoring context after /clear or starting a new session.
+ * Now that we store raw turn_context instead of regex-extracted signals,
+ * the LLM handles all semantic interpretation. This module provides formatting
+ * and fallback display for when LLM is unavailable.
  */
 
 import type { SessionAccumulator, SessionSignal, SignalType } from '../types/session.js';
@@ -64,29 +65,17 @@ export interface ActiveSessionSummary {
 /**
  * Determine the importance level of a signal
  *
- * Reuses Gate 4 thresholds from extraction-gates.ts:
- * - decision_made: content > 30 chars -> CRITICAL
- * - problem_discovered: has files -> HIGH
- * - pattern_observed: content > 50 chars -> MEDIUM
- * - goal_stated: content > 20 chars -> MEDIUM
- * - file_touched: always SKIP (noise)
+ * With turn_context signals, importance is based on content length.
+ * The LLM will do the real semantic analysis during consolidation.
  */
 export function getImportanceLevel(signal: SessionSignal): ImportanceLevel {
   switch (signal.signal_type) {
-    case 'decision_made':
-      return signal.content.length > 30 ? 'critical' : 'skip';
-
-    case 'problem_discovered':
-      return signal.files && signal.files.length > 0 ? 'high' : 'medium';
-
-    case 'pattern_observed':
-      return signal.content.length > 50 ? 'medium' : 'skip';
-
-    case 'goal_stated':
-      return signal.content.length > 20 ? 'medium' : 'skip';
+    case 'turn_context':
+      // Turn context with substantial content is important
+      return signal.content.length > 100 ? 'high' : 'medium';
 
     case 'file_touched':
-      // Always skip - we track files separately in files_touched_all
+      // Skip file_touched - we track files separately
       return 'skip';
 
     default:
@@ -130,13 +119,23 @@ export function filterValuableSignals(signals: readonly SessionSignal[]): readon
 
 /**
  * Extract the primary goal from session signals (if any)
+ *
+ * With turn_context signals, we look for "User:" prefix content
+ * to extract what the user was asking about.
  */
 function extractGoal(signals: readonly SessionSignal[]): string | undefined {
-  // Find the first goal signal with substantial content
-  const goalSignal = signals.find(
-    s => s.signal_type === 'goal_stated' && s.content.length > 20
-  );
-  return goalSignal?.content;
+  // Find the first turn_context with user content
+  const turnContext = signals.find(s => s.signal_type === 'turn_context');
+  if (!turnContext) return undefined;
+
+  // Extract the user portion if present
+  const userMatch = turnContext.content.match(/^User:\s*(.+?)(?:\n|$)/);
+  if (userMatch?.[1]) {
+    const goal = userMatch[1].trim();
+    return goal.length > 100 ? goal.slice(0, 100) + '...' : goal;
+  }
+
+  return undefined;
 }
 
 /**
@@ -211,24 +210,14 @@ function formatActiveSession(session: SessionAccumulator): string {
     lines.push(`Goal: ${summary.goal}`);
   }
 
-  // Group signals by type for cleaner output
-  const decisions = summary.key_signals.filter(s => s.type === 'decision_made');
-  const problems = summary.key_signals.filter(s => s.type === 'problem_discovered');
-  const patterns = summary.key_signals.filter(s => s.type === 'pattern_observed');
-
-  for (const decision of decisions) {
-    lines.push(`Decision: ${decision.content}`);
-  }
-
-  for (const problem of problems) {
-    const fileInfo = problem.files?.length
-      ? ` (${problem.files.slice(0, 2).join(', ')}${problem.files.length > 2 ? '...' : ''})`
-      : '';
-    lines.push(`Problem: ${problem.content}${fileInfo}`);
-  }
-
-  for (const pattern of patterns) {
-    lines.push(`Pattern: ${pattern.content}`);
+  // Show turn context signals (the actual conversation)
+  const turnContexts = summary.key_signals.filter(s => s.type === 'turn_context');
+  for (const ctx of turnContexts.slice(0, 3)) {
+    // Truncate for display
+    const truncated = ctx.content.length > 200
+      ? ctx.content.slice(0, 200) + '...'
+      : ctx.content;
+    lines.push(truncated);
   }
 
   if (summary.files_touched.length > 0) {
@@ -245,6 +234,8 @@ function formatActiveSession(session: SessionAccumulator): string {
 
 /**
  * Format a recent session summary for human-readable output
+ *
+ * Handles both old signal types (backwards compatibility) and new turn_context.
  */
 function formatRecentSession(summary: RecentSessionSummary): string {
   const lines: string[] = [];
@@ -255,12 +246,9 @@ function formatRecentSession(summary: RecentSessionSummary): string {
 
   // Show top 2 key signals
   for (const signal of summary.key_signals.slice(0, 2)) {
-    const label = signal.type === 'decision_made' ? 'Decision'
-      : signal.type === 'problem_discovered' ? 'Problem'
-      : signal.type === 'pattern_observed' ? 'Pattern'
-      : signal.type === 'goal_stated' ? 'Goal'
-      : 'Note';
-    lines.push(`  - ${label}: ${signal.content.slice(0, 80)}${signal.content.length > 80 ? '...' : ''}`);
+    const truncated = signal.content.slice(0, 80);
+    const suffix = signal.content.length > 80 ? '...' : '';
+    lines.push(`  - ${truncated}${suffix}`);
   }
 
   if (summary.files_touched.length > 0) {

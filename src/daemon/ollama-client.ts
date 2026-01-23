@@ -128,9 +128,8 @@ export async function generate(
       prompt,
       stream: false,
       options: {
-        // Reasonable defaults for extraction
         temperature: 0.3, // Low temperature for consistent JSON output
-        num_predict: 2048, // Enough for memo extraction
+        // No num_predict limit - local Ollama has no cost, let model complete naturally
       },
     });
 

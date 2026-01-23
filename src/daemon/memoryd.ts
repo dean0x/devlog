@@ -92,7 +92,6 @@ import {
   clearCatchUpDirty,
   shouldRecomputeSummary,
 } from '../catch-up/precomputed-store.js';
-import { evaluateGates, shouldProcessSession } from './extraction-gates.js';
 import {
   findStaleSessions,
   finalizeSession,
@@ -245,14 +244,15 @@ async function checkForStaleSessions(
 
     // Finalize each stale session
     for (const session of staleResult.value) {
-      logger.info(`Found stale session ${session.session_id} for ${projectPath}`, {
+      logger.info(`Found stale session for ${projectPath}`, {
         signals: session.signals.length,
         last_activity: session.last_activity,
       });
 
       const finalizeResult = await finalizeSession(sessionStoreConfig, session.session_id);
       if (!finalizeResult.ok) {
-        logger.warn(`Failed to finalize session ${session.session_id}`, {
+        logger.warn(`Failed to finalize session`, {
+          project: projectPath,
           error: finalizeResult.error.message,
         });
       }
@@ -284,7 +284,7 @@ async function processSessionConsolidations(
     }
 
     for (const session of sessionsResult.value) {
-      logger.info(`Consolidating session ${session.session_id}`, {
+      logger.info(`Consolidating session`, {
         project: projectPath,
         signals: session.signals.length,
       });
@@ -316,7 +316,8 @@ async function processSessionConsolidations(
           await updateIndex(knowledgeStoreConfig);
         }
 
-        logger.info(`Session ${session.session_id} consolidated`, {
+        logger.info(`Session consolidated`, {
+          project: projectPath,
           action: result.action,
           knowledge_updated: result.knowledgeUpdated,
         });
@@ -325,8 +326,9 @@ async function processSessionConsolidations(
         state.sessionsProcessed++;
         state.lastConsolidation = new Date();
       } else {
-        logger.warn(`Session consolidation failed: ${result.error}`, {
-          session_id: session.session_id,
+        logger.warn(`Session consolidation failed`, {
+          project: projectPath,
+          error: result.error,
         });
       }
     }
@@ -346,58 +348,20 @@ async function processSessionConsolidation(
   knowledgeUpdated?: boolean;
   error?: string;
 }> {
-  // Check if session should be processed (quick gate)
-  if (!shouldProcessSession(session)) {
-    return { success: true, action: 'skip_gates', knowledgeUpdated: false };
+  // Always call LLM - it handles skip/confirm/create decisions
+  // The LLM prompt already covers all semantic decisions that the old gates
+  // tried to handle with brittle heuristics (word similarity, length thresholds)
+  const extractResult = await extractSessionKnowledge(
+    session,
+    knowledgeStoreConfig,
+    extractorConfig
+  );
+
+  if (!extractResult.ok) {
+    return { success: false, error: extractResult.error.message };
   }
 
-  // Run full gate evaluation
-  const gateResult = await evaluateGates(session, knowledgeStoreConfig);
-  if (!gateResult.ok) {
-    return { success: false, error: gateResult.error.message };
-  }
-
-  const gate = gateResult.value;
-  logger.debug('Gate evaluation result', {
-    action: gate.action,
-    reasoning: gate.reasoning,
-    signals_passed: gate.signals_passed,
-  });
-
-  switch (gate.action) {
-    case 'skip':
-      return { success: true, action: 'skip', knowledgeUpdated: false };
-
-    case 'confirm_pattern':
-      // Just bump observation count - no LLM needed
-      if (gate.matchedSection) {
-        const confirmResult = await confirmSection(
-          knowledgeStoreConfig,
-          gate.matchedSection.category,
-          gate.matchedSection.section.id
-        );
-        if (confirmResult.ok) {
-          return { success: true, action: 'confirm_pattern', knowledgeUpdated: true };
-        }
-      }
-      return { success: true, action: 'confirm_pattern', knowledgeUpdated: false };
-
-    case 'consolidate':
-    case 'create_new':
-      // Run LLM extraction
-      const extractResult = await extractSessionKnowledge(
-        session,
-        knowledgeStoreConfig,
-        extractorConfig
-      );
-
-      if (!extractResult.ok) {
-        return { success: false, error: extractResult.error.message };
-      }
-
-      const decision = extractResult.value;
-      return await applyConsolidationDecision(decision, knowledgeStoreConfig);
-  }
+  return await applyConsolidationDecision(extractResult.value, knowledgeStoreConfig);
 }
 
 /**

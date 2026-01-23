@@ -19,17 +19,18 @@
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+
 import type { SessionSignal } from '../types/session.js';
-import type { KnowledgeCategory, KnowledgeFile, KnowledgeSection } from '../storage/knowledge-store.js';
+import type { KnowledgeCategory, KnowledgeSection } from '../storage/knowledge-store.js';
 import type { SessionConsolidationDecision } from './extractor.js';
 
 /**
  * Type for existing knowledge context
- * Accepts either full KnowledgeFile or simplified sections-only format
+ * Accepts any object with a sections array (works with both KnowledgeFile and simplified format)
  */
 export type ExistingKnowledgeContext = Map<
   KnowledgeCategory,
-  KnowledgeFile | { readonly sections: readonly KnowledgeSection[] }
+  { readonly sections: readonly KnowledgeSection[] }
 >;
 
 // ============================================================================
@@ -114,10 +115,7 @@ class DebugWriterImpl implements DebugWriter {
   }
 
   async writeExistingKnowledge(knowledge: ExistingKnowledgeContext): Promise<void> {
-    const serializable: Record<string, KnowledgeFile | { readonly sections: readonly KnowledgeSection[] }> = {};
-    for (const [category, file] of knowledge) {
-      serializable[category] = file;
-    }
+    const serializable = Object.fromEntries(knowledge);
     await this.safeWrite('02-existing-knowledge.json', this.formatJson(serializable));
   }
 

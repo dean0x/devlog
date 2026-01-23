@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { formatDistanceToNow, parseISO } from 'date-fns';
-import type { SessionAccumulator, SessionSignal } from '../types/session.js';
+import type { SessionAccumulator } from '../types/session.js';
 import type { RecentSessionSummary } from './recent-sessions.js';
 import type { Result, StorageError } from '../types/index.js';
 import { Ok, Err } from '../types/index.js';
@@ -141,39 +141,21 @@ async function writeCache(
 // ============================================================================
 
 /**
- * Format a session signal for the prompt
- */
-function formatSignal(signal: SessionSignal): string {
-  const typeLabel = signal.signal_type === 'goal_stated' ? 'Goal'
-    : signal.signal_type === 'decision_made' ? 'Decision'
-    : signal.signal_type === 'problem_discovered' ? 'Problem'
-    : signal.signal_type === 'pattern_observed' ? 'Pattern'
-    : 'Note';
-
-  let line = `- ${typeLabel}: ${signal.content}`;
-  if (signal.files && signal.files.length > 0) {
-    line += ` (${signal.files.slice(0, 3).join(', ')})`;
-  }
-  return line;
-}
-
-/**
  * Format an active session for the prompt
+ *
+ * Now that we store raw turn context instead of regex-extracted signals,
+ * we just pass through the turn content directly for LLM analysis.
  */
 function formatActiveSessionForPrompt(session: SessionAccumulator): string {
   const age = formatDistanceToNow(parseISO(session.started_at), { addSuffix: true });
   const lines: string[] = [`Current Session (started ${age}):`];
 
-  // Filter to valuable signals only
-  const valuableSignals = session.signals.filter(s =>
-    s.signal_type !== 'file_touched' &&
-    (s.signal_type !== 'pattern_observed' || s.content.length > 50) &&
-    (s.signal_type !== 'goal_stated' || s.content.length > 20) &&
-    (s.signal_type !== 'decision_made' || s.content.length > 30)
-  );
+  // Get turn context signals (the actual conversation)
+  const turnContexts = session.signals.filter(s => s.signal_type === 'turn_context');
 
-  for (const signal of valuableSignals) {
-    lines.push(formatSignal(signal));
+  for (const signal of turnContexts.slice(0, 5)) { // Limit to recent turns
+    lines.push('');
+    lines.push(signal.content);
   }
 
   if (session.files_touched_all.length > 0) {
@@ -181,7 +163,8 @@ function formatActiveSessionForPrompt(session: SessionAccumulator): string {
     const more = session.files_touched_all.length > 5
       ? ` (+${session.files_touched_all.length - 5} more)`
       : '';
-    lines.push(`- Files touched: ${files}${more}`);
+    lines.push('');
+    lines.push(`Files touched: ${files}${more}`);
   }
 
   return lines.join('\n');
@@ -189,6 +172,8 @@ function formatActiveSessionForPrompt(session: SessionAccumulator): string {
 
 /**
  * Format a recent session summary for the prompt
+ *
+ * Handles both old signal types (for backwards compatibility) and new turn_context format.
  */
 function formatRecentSessionForPrompt(summary: RecentSessionSummary): string {
   const age = formatDistanceToNow(parseISO(summary.consolidated_at), { addSuffix: true });
@@ -197,11 +182,15 @@ function formatRecentSessionForPrompt(summary: RecentSessionSummary): string {
   const lines: string[] = [`[${age}] ${goal}`];
 
   for (const signal of summary.key_signals.slice(0, 3)) {
-    const typeLabel = signal.type === 'decision_made' ? 'Decision'
-      : signal.type === 'problem_discovered' ? 'Problem'
-      : signal.type === 'pattern_observed' ? 'Pattern'
-      : 'Note';
-    lines.push(`  - ${typeLabel}: ${signal.content.slice(0, 100)}${signal.content.length > 100 ? '...' : ''}`);
+    // Handle both old signal types and new turn_context
+    if (signal.type === 'turn_context') {
+      // New format: show truncated content
+      const truncated = signal.content.slice(0, 150);
+      lines.push(`  ${truncated}${signal.content.length > 150 ? '...' : ''}`);
+    } else {
+      // Old format (backwards compatibility): show with label
+      lines.push(`  - ${signal.content.slice(0, 100)}${signal.content.length > 100 ? '...' : ''}`);
+    }
   }
 
   return lines.join('\n');
@@ -305,7 +294,7 @@ export async function generateLLMSummary(
       messages: [{ role: 'user', content: prompt }],
       options: {
         temperature: 0.3,
-        num_predict: 500,
+        // No num_predict limit - local Ollama has no cost, let model complete naturally
       },
     });
 

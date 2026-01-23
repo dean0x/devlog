@@ -15,6 +15,15 @@
 
 import { Ollama } from 'ollama';
 
+import type { Result, DaemonError } from '../types/index.js';
+import { Ok, Err } from '../types/index.js';
+import type { SessionAccumulator, SessionSignal } from '../types/session.js';
+import type {
+  KnowledgeSection,
+  KnowledgeCategory,
+  KnowledgeStoreConfig,
+} from '../storage/knowledge-store.js';
+import { readAllKnowledge } from '../storage/knowledge-store.js';
 import { createDebugWriter } from './debug-writer.js';
 
 // ============================================================================
@@ -35,19 +44,6 @@ function debugLog(msg: string, data?: Record<string, unknown>): void {
   }
   console.log(`[${timestamp}] [DEBUG] [extractor] ${msg}${dataStr}`);
 }
-
-import type {
-  Result,
-  DaemonError,
-} from '../types/index.js';
-import { Ok, Err } from '../types/index.js';
-import type { SessionAccumulator, SessionSignal } from '../types/session.js';
-import type {
-  KnowledgeSection,
-  KnowledgeCategory,
-  KnowledgeStoreConfig,
-} from '../storage/knowledge-store.js';
-import { readAllKnowledge } from '../storage/knowledge-store.js';
 
 export interface ExtractorConfig {
   readonly ollamaUrl: string;
@@ -72,7 +68,11 @@ async function withProjectLock<T>(
 ): Promise<T> {
   const currentLock = projectLocks.get(projectPath) ?? Promise.resolve();
 
-  let releaseLock: () => void;
+  // Deferred promise pattern: we need a promise we can resolve externally
+  // so that subsequent callers can chain after this operation completes.
+  // The releaseLock function is captured in the finally block and called
+  // when this operation finishes, allowing the next queued operation to proceed.
+  let releaseLock: () => void = () => {};
   const newLock = new Promise<void>((resolve) => {
     releaseLock = resolve;
   });
@@ -86,7 +86,7 @@ async function withProjectLock<T>(
   try {
     return await execution;
   } finally {
-    releaseLock!();
+    releaseLock();
     // Clean up if this is still the current lock
     if (projectLocks.get(projectPath) === newLock) {
       projectLocks.delete(projectPath);
@@ -123,7 +123,8 @@ function extractJsonFromResponse(response: string): string | null {
       continue;
     }
 
-    if (char === '"' && !escape) {
+    // At this point, escape is always false (if it was true, we continued above)
+    if (char === '"') {
       inString = !inString;
       continue;
     }

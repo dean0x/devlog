@@ -2,14 +2,15 @@
  * Session Types for Session-Based Knowledge Consolidation
  *
  * ARCHITECTURE: Session-level accumulation instead of per-turn extraction
- * Pattern: Accumulate signals during session, consolidate at session end
+ * Pattern: Accumulate raw turn context during session, let LLM analyze during consolidation
  *
- * Signal types represent different kinds of valuable information:
- * - file_touched: Files modified during the session
- * - decision_made: Explicit choices with rationale
- * - pattern_observed: Recurring patterns or conventions discovered
- * - problem_discovered: Issues, bugs, or technical debt found
- * - goal_stated: Objectives or tasks being worked on
+ * Signal types:
+ * - file_touched: Files modified during the session (factual)
+ * - turn_context: Raw turn data (user prompt + assistant summary) for LLM analysis
+ *
+ * NOTE: We deliberately avoid regex-based "signal extraction" (decision_made, goal_stated, etc.)
+ * because regex cannot understand semantics and produces garbage. The LLM handles all
+ * semantic interpretation during consolidation.
  */
 
 // ============================================================================
@@ -21,10 +22,7 @@
  */
 export type SignalType =
   | 'file_touched'
-  | 'decision_made'
-  | 'pattern_observed'
-  | 'problem_discovered'
-  | 'goal_stated';
+  | 'turn_context';
 
 /**
  * A single signal captured during a session turn

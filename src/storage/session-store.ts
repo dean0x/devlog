@@ -40,6 +40,16 @@ function getSessionFilePath(memoryDir: string, sessionId: string): string {
   return join(getWorkingDir(memoryDir), `${SESSION_FILE_PREFIX}${sessionId}${SESSION_FILE_EXTENSION}`);
 }
 
+/**
+ * Generate a unique session ID when Claude Code doesn't provide one
+ * Format: sess-{timestamp}-{random4chars}
+ */
+function generateSessionId(): string {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).slice(2, 6);
+  return `sess-${timestamp}-${random}`;
+}
+
 // ============================================================================
 // Session Store Operations
 // ============================================================================
@@ -164,24 +174,70 @@ export async function deleteSession(
 }
 
 /**
+ * Find any active session for this project
+ * Used when sessionId is "unknown" to continue an existing session
+ * Returns the session or null if none found
+ */
+async function findActiveSession(
+  config: SessionStoreConfig
+): Promise<SessionAccumulator | null> {
+  const workingDir = getWorkingDir(config.memoryDir);
+
+  try {
+    const files = await fs.readdir(workingDir);
+    const sessionFiles = files.filter(f =>
+      f.startsWith(SESSION_FILE_PREFIX) && f.endsWith(SESSION_FILE_EXTENSION)
+    );
+
+    for (const file of sessionFiles) {
+      const sessionId = file.slice(SESSION_FILE_PREFIX.length, -SESSION_FILE_EXTENSION.length);
+      const result = await readSession(config, sessionId);
+      if (result.ok && result.value !== null && result.value.status === 'active') {
+        return result.value;
+      }
+    }
+  } catch {
+    // Directory doesn't exist or read error - no active sessions
+  }
+
+  return null;
+}
+
+/**
  * Get or create a session for the given session ID
+ *
+ * ARCHITECTURE: Handles "unknown" session IDs gracefully
+ * When CLAUDE_SESSION_ID is not provided by Claude Code (always "unknown"),
+ * we either continue an existing active session or generate a unique ID.
+ * This prevents session-unknown.json collisions across different sessions.
  */
 export async function getOrCreateSession(
   config: SessionStoreConfig,
   sessionId: string,
   projectPath: string
 ): Promise<Result<SessionAccumulator, StorageError>> {
-  const readResult = await readSession(config, sessionId);
-  if (!readResult.ok) {
-    return readResult;
+  // If sessionId is a real ID (not "unknown"), try to find existing session
+  if (sessionId !== 'unknown') {
+    const readResult = await readSession(config, sessionId);
+    if (!readResult.ok) {
+      return readResult;
+    }
+
+    if (readResult.value !== null) {
+      return Ok(readResult.value);
+    }
   }
 
-  if (readResult.value !== null) {
-    return Ok(readResult.value);
+  // For "unknown" sessionId, find any active session for this project
+  // This handles Claude Code not providing CLAUDE_SESSION_ID to hooks
+  const activeSession = await findActiveSession(config);
+  if (activeSession !== null) {
+    return Ok(activeSession);
   }
 
-  // Create new session
-  const session = createSession(sessionId, projectPath);
+  // No active session found - create new one with unique ID
+  const newSessionId = sessionId !== 'unknown' ? sessionId : generateSessionId();
+  const session = createSession(newSessionId, projectPath);
   const writeResult = await writeSession(config, session);
   if (!writeResult.ok) {
     return writeResult;
@@ -436,8 +492,12 @@ export async function archiveSession(
 /**
  * Extract signals from a turn's content
  *
- * ARCHITECTURE: Simple heuristic extraction of signals
- * Pattern: Look for decision markers, problems, goals in the response
+ * ARCHITECTURE: Store raw turn context for LLM analysis during consolidation
+ * Pattern: No regex interpretation - LLM handles all semantic extraction
+ *
+ * We store:
+ * - file_touched: Which files were modified (factual)
+ * - turn_context: Full user prompt + assistant response for LLM to analyze
  */
 export function extractSignalsFromTurn(
   turnNumber: number,
@@ -447,7 +507,7 @@ export function extractSignalsFromTurn(
 ): SessionSignal[] {
   const signals: SessionSignal[] = [];
 
-  // Always record files touched as a signal
+  // Record files touched (factual signal)
   if (filesTouched.length > 0) {
     signals.push(createSignal(
       turnNumber,
@@ -457,68 +517,14 @@ export function extractSignalsFromTurn(
     ));
   }
 
-  // Look for decision patterns in the response
-  const decisionPatterns = [
-    /(?:decided|choosing|using|went with|opted for|selected)\s+(.{10,100})/gi,
-    /(?:because|since|due to|reason:?)\s+(.{10,100})/gi,
-  ];
-
-  for (const pattern of decisionPatterns) {
-    const matches = assistantResponse.matchAll(pattern);
-    for (const match of matches) {
-      const content = match[1]?.trim();
-      if (content && content.length > 20) {
-        signals.push(createSignal(
-          turnNumber,
-          'decision_made',
-          content.slice(0, 200),
-          filesTouched
-        ));
-        break; // Only one decision per pattern
-      }
-    }
-  }
-
-  // Look for problem patterns
-  const problemPatterns = [
-    /(?:issue|problem|bug|error|warning|failed|broken)[:.]?\s+(.{10,100})/gi,
-    /(?:doesn't work|not working|failing|crashed|broke)\s*(.{0,100})/gi,
-  ];
-
-  for (const pattern of problemPatterns) {
-    const matches = userPrompt.matchAll(pattern);
-    for (const match of matches) {
-      const content = match[1]?.trim() || match[0];
-      if (content && content.length > 10) {
-        signals.push(createSignal(
-          turnNumber,
-          'problem_discovered',
-          content.slice(0, 200)
-        ));
-        break;
-      }
-    }
-  }
-
-  // Look for goal patterns in user prompt
-  const goalPatterns = [
-    /(?:implement|add|create|build|fix|update|refactor)\s+(.{10,100})/gi,
-    /(?:i want to|need to|trying to|working on)\s+(.{10,100})/gi,
-  ];
-
-  for (const pattern of goalPatterns) {
-    const matches = userPrompt.matchAll(pattern);
-    for (const match of matches) {
-      const content = match[1]?.trim();
-      if (content && content.length > 15) {
-        signals.push(createSignal(
-          turnNumber,
-          'goal_stated',
-          content.slice(0, 200)
-        ));
-        break;
-      }
-    }
+  // Store full turn context for LLM analysis (no truncation)
+  if (userPrompt.trim().length > 10 || assistantResponse.trim().length > 10) {
+    signals.push(createSignal(
+      turnNumber,
+      'turn_context',
+      `User: ${userPrompt}\n\nAssistant: ${assistantResponse}`,
+      filesTouched
+    ));
   }
 
   return signals;
