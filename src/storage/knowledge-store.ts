@@ -56,6 +56,9 @@ export interface KnowledgeSection {
   readonly related_files?: readonly string[];
   readonly tags?: readonly string[];
   readonly examples?: readonly string[];
+  // Staleness tracking fields (optional for backward compatibility)
+  readonly last_referenced?: string;  // ISO timestamp - when last surfaced to user
+  readonly last_confirmed?: string;   // ISO timestamp - when last validated by LLM
 }
 
 /**
@@ -81,6 +84,16 @@ export interface KnowledgeFile {
 
 const KNOWLEDGE_DIR = 'knowledge';
 const INDEX_FILE = 'index.md';
+
+// ============================================================================
+// Staleness Constants
+// ============================================================================
+
+/** Days without confirmation before established/developing -> tentative */
+export const DECAY_THRESHOLD_DAYS = 30;
+
+/** Days without confirmation before flagging for review */
+export const REVIEW_THRESHOLD_DAYS = 90;
 
 const CATEGORY_TITLES: Record<KnowledgeCategory, string> = {
   conventions: 'Conventions',
@@ -184,6 +197,10 @@ function parseSections(content: string): KnowledgeSection[] {
     const observationsMatch = body.match(/\*\*Observations\*\*:\s*(\d+)/);
     const relatedFilesMatch = body.match(/\*\*Related files\*\*:\s*`([^`]+)`/);
     const tagsMatch = body.match(/\*\*Tags\*\*:\s*(.+)/);
+    const lastUpdatedMatch = body.match(/\*\*Last updated\*\*:\s*([\dT:.Z+-]+)/);
+    // Staleness tracking fields
+    const lastReferencedMatch = body.match(/\*\*Last referenced\*\*:\s*([\dT:.Z+-]+)/);
+    const lastConfirmedMatch = body.match(/\*\*Last confirmed\*\*:\s*([\dT:.Z+-]+)/);
 
     // Extract content (everything before the metadata block)
     const metadataStart = body.indexOf('**Confidence**');
@@ -212,11 +229,14 @@ function parseSections(content: string): KnowledgeSection[] {
       content: contentText,
       confidence,
       first_observed: firstObservedMatch?.[1] ?? new Date().toISOString().split('T')[0] ?? '',
-      last_updated: new Date().toISOString(),
+      last_updated: lastUpdatedMatch?.[1] ?? new Date().toISOString(),
       observations: parseInt(observationsMatch?.[1] ?? '1', 10),
       related_files: relatedFilesMatch?.[1]?.split(',').map(f => f.trim()),
       tags: tagsMatch?.[1]?.split(',').map(t => t.trim()),
       examples: examples.length > 0 ? examples : undefined,
+      // Staleness tracking fields (undefined if not present for backward compatibility)
+      last_referenced: lastReferencedMatch?.[1],
+      last_confirmed: lastConfirmedMatch?.[1],
     });
   }
 
@@ -240,6 +260,7 @@ function serializeSection(section: KnowledgeSection): string {
 
   markdown += `**Confidence**: ${section.confidence}\n`;
   markdown += `**First observed**: ${section.first_observed}\n`;
+  markdown += `**Last updated**: ${section.last_updated}\n`;
   markdown += `**Observations**: ${section.observations}\n`;
 
   if (section.related_files && section.related_files.length > 0) {
@@ -248,6 +269,15 @@ function serializeSection(section: KnowledgeSection): string {
 
   if (section.tags && section.tags.length > 0) {
     markdown += `**Tags**: ${section.tags.join(', ')}\n`;
+  }
+
+  // Staleness tracking fields (only if present)
+  if (section.last_referenced) {
+    markdown += `**Last referenced**: ${section.last_referenced}\n`;
+  }
+
+  if (section.last_confirmed) {
+    markdown += `**Last confirmed**: ${section.last_confirmed}\n`;
   }
 
   markdown += '\n---\n\n';
@@ -494,11 +524,13 @@ export async function confirmSection(
     newConfidence = 'developing';
   }
 
+  const now = new Date().toISOString();
   const updatedSection: KnowledgeSection = {
     ...existing,
     observations: newObservations,
     confidence: newConfidence,
-    last_updated: new Date().toISOString(),
+    last_updated: now,
+    last_confirmed: now,  // Confirmation sets last_confirmed timestamp
   };
 
   const updatedSections = [
@@ -714,4 +746,198 @@ export function createSection(
     tags: options.tags,
     examples: options.examples,
   };
+}
+
+// ============================================================================
+// Staleness Tracking Functions
+// ============================================================================
+
+/**
+ * Stale knowledge section with category context
+ */
+export interface StaleKnowledgeSection {
+  readonly category: KnowledgeCategory;
+  readonly section: KnowledgeSection;
+  readonly daysSinceConfirmed: number;
+  readonly eligibleForDecay: boolean;    // 30+ days
+  readonly eligibleForReview: boolean;   // 90+ days
+}
+
+/**
+ * Record that a knowledge section was referenced (surfaced to user)
+ *
+ * ARCHITECTURE: Fire-and-forget pattern - updates last_referenced timestamp
+ * Pattern: Called when knowledge is displayed to track usage
+ */
+export async function recordKnowledgeReference(
+  config: KnowledgeStoreConfig,
+  category: KnowledgeCategory,
+  sectionId: string
+): Promise<Result<void, StorageError>> {
+  const readResult = await readKnowledgeFile(config, category);
+  if (!readResult.ok) {
+    return readResult;
+  }
+
+  const index = readResult.value.sections.findIndex(s => s.id === sectionId);
+  if (index === -1) {
+    // Section not found - not an error for fire-and-forget
+    return Ok(undefined);
+  }
+
+  const existing = readResult.value.sections[index];
+  if (!existing) {
+    return Ok(undefined);
+  }
+
+  const updatedSection: KnowledgeSection = {
+    ...existing,
+    last_referenced: new Date().toISOString(),
+  };
+
+  const updatedSections = [
+    ...readResult.value.sections.slice(0, index),
+    updatedSection,
+    ...readResult.value.sections.slice(index + 1),
+  ];
+
+  return writeKnowledgeFile(config, category, updatedSections);
+}
+
+/**
+ * Find stale knowledge sections eligible for decay or review
+ *
+ * ARCHITECTURE: Returns sections that need attention based on time thresholds
+ * Pattern: NEVER includes canonical confidence - canonical knowledge never decays
+ *
+ * @param config - Knowledge store configuration
+ * @param options - Optional threshold overrides
+ * @returns Array of stale sections with metadata
+ */
+export async function findStaleKnowledge(
+  config: KnowledgeStoreConfig,
+  options: {
+    decayThresholdDays?: number;
+    reviewThresholdDays?: number;
+  } = {}
+): Promise<Result<StaleKnowledgeSection[], StorageError>> {
+  const decayThreshold = options.decayThresholdDays ?? DECAY_THRESHOLD_DAYS;
+  const reviewThreshold = options.reviewThresholdDays ?? REVIEW_THRESHOLD_DAYS;
+  const now = Date.now();
+  const staleSections: StaleKnowledgeSection[] = [];
+
+  for (const category of getAllCategories()) {
+    const readResult = await readKnowledgeFile(config, category);
+    if (!readResult.ok) {
+      continue; // Skip on error, don't fail entire search
+    }
+
+    for (const section of readResult.value.sections) {
+      // CRITICAL: canonical confidence NEVER decays
+      if (section.confidence === 'canonical') {
+        continue;
+      }
+
+      // Use last_confirmed as primary, fall back to last_updated
+      const lastConfirmedStr = section.last_confirmed ?? section.last_updated;
+      const lastConfirmed = new Date(lastConfirmedStr).getTime();
+      const daysSinceConfirmed = Math.floor((now - lastConfirmed) / (1000 * 60 * 60 * 24));
+
+      const eligibleForDecay = daysSinceConfirmed >= decayThreshold;
+      const eligibleForReview = daysSinceConfirmed >= reviewThreshold;
+
+      if (eligibleForDecay || eligibleForReview) {
+        staleSections.push({
+          category,
+          section,
+          daysSinceConfirmed,
+          eligibleForDecay,
+          eligibleForReview,
+        });
+      }
+    }
+  }
+
+  // Sort by staleness (most stale first)
+  staleSections.sort((a, b) => b.daysSinceConfirmed - a.daysSinceConfirmed);
+
+  return Ok(staleSections);
+}
+
+/**
+ * Decay result from applying confidence decay to a section
+ */
+export interface DecayResult {
+  readonly sectionId: string;
+  readonly category: KnowledgeCategory;
+  readonly action: 'decayed' | 'flagged_for_review' | 'skipped';
+  readonly previousConfidence?: ConfidenceLevel;
+  readonly newConfidence?: ConfidenceLevel;
+  readonly daysSinceConfirmed: number;
+}
+
+/**
+ * Apply confidence decay to a stale section
+ *
+ * ARCHITECTURE: Decays confidence based on time since last confirmation
+ * Pattern:
+ *   - canonical -> NEVER decays (this function is never called for canonical)
+ *   - established + 30 days -> tentative
+ *   - developing + 30 days -> tentative
+ *   - tentative + 90 days -> flagged for review (no further decay)
+ *
+ * @param config - Knowledge store configuration
+ * @param staleSection - Section to potentially decay
+ * @returns Result of decay application
+ */
+export async function applyConfidenceDecay(
+  config: KnowledgeStoreConfig,
+  staleSection: StaleKnowledgeSection
+): Promise<Result<DecayResult, StorageError>> {
+  const { category, section, daysSinceConfirmed, eligibleForDecay, eligibleForReview } = staleSection;
+
+  // Safety check: canonical NEVER decays
+  if (section.confidence === 'canonical') {
+    return Ok({
+      sectionId: section.id,
+      category,
+      action: 'skipped',
+      daysSinceConfirmed,
+    });
+  }
+
+  // Determine action based on confidence and age
+  let newConfidence: ConfidenceLevel | undefined;
+  let action: DecayResult['action'] = 'skipped';
+
+  if (section.confidence === 'established' && eligibleForDecay) {
+    newConfidence = 'tentative';
+    action = 'decayed';
+  } else if (section.confidence === 'developing' && eligibleForDecay) {
+    newConfidence = 'tentative';
+    action = 'decayed';
+  } else if (section.confidence === 'tentative' && eligibleForReview) {
+    // Already tentative - flag for review but don't decay further
+    action = 'flagged_for_review';
+  }
+
+  // Apply decay if needed
+  if (newConfidence) {
+    const updateResult = await updateSection(config, category, section.id, {
+      confidence: newConfidence,
+    });
+
+    if (!updateResult.ok) {
+      return updateResult;
+    }
+  }
+
+  return Ok({
+    sectionId: section.id,
+    category,
+    action,
+    previousConfidence: section.confidence,
+    newConfidence,
+    daysSinceConfirmed,
+  });
 }

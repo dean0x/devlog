@@ -24,6 +24,7 @@ import {
   getAllCategories,
   getCategoryTitle,
   updateIndex,
+  recordKnowledgeReference,
   type KnowledgeCategory,
   type KnowledgeStoreConfig,
 } from './storage/knowledge-store.js';
@@ -546,6 +547,10 @@ async function showKnowledge(category?: string): Promise<void> {
         console.log(`  Files: ${section.related_files.slice(0, 3).join(', ')}`);
       }
       console.log();
+
+      // Fire-and-forget: Track that this section was referenced
+      recordKnowledgeReference(knowledgeStoreConfig, category as KnowledgeCategory, section.id)
+        .catch(() => {}); // Ignore errors silently
     }
   } else {
     // Show summary of all categories
@@ -571,6 +576,10 @@ async function showKnowledge(category?: string): Promise<void> {
 
       for (const section of topSections) {
         console.log(`  - [${section.id}] ${section.title} (${section.confidence})`);
+
+        // Fire-and-forget: Track that this section was referenced
+        recordKnowledgeReference(knowledgeStoreConfig, cat, section.id)
+          .catch(() => {}); // Ignore errors silently
       }
 
       if (file.sections.length > 3) {
@@ -624,6 +633,10 @@ async function searchKnowledgeCommand(query: string): Promise<void> {
     console.log(`  ${match.section.content.slice(0, 150)}...`);
     console.log(`  Confidence: ${match.section.confidence} | Observations: ${match.section.observations}`);
     console.log();
+
+    // Fire-and-forget: Track that this section was referenced
+    recordKnowledgeReference(knowledgeStoreConfig, match.category, match.section.id)
+      .catch(() => {}); // Ignore errors silently
   }
 }
 
