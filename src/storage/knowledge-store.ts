@@ -59,6 +59,7 @@ export interface KnowledgeSection {
   // Staleness tracking fields (optional for backward compatibility)
   readonly last_referenced?: string;  // ISO timestamp - when last surfaced to user
   readonly last_confirmed?: string;   // ISO timestamp - when last validated by LLM
+  readonly flagged_for_review?: string;  // ISO timestamp - when flagged for human review
 }
 
 /**
@@ -201,6 +202,7 @@ function parseSections(content: string): KnowledgeSection[] {
     // Staleness tracking fields
     const lastReferencedMatch = body.match(/\*\*Last referenced\*\*:\s*([\dT:.Z+-]+)/);
     const lastConfirmedMatch = body.match(/\*\*Last confirmed\*\*:\s*([\dT:.Z+-]+)/);
+    const flaggedForReviewMatch = body.match(/\*\*Flagged for review\*\*:\s*([\dT:.Z+-]+)/);
 
     // Extract content (everything before the metadata block)
     const metadataStart = body.indexOf('**Confidence**');
@@ -237,6 +239,7 @@ function parseSections(content: string): KnowledgeSection[] {
       // Staleness tracking fields (undefined if not present for backward compatibility)
       last_referenced: lastReferencedMatch?.[1],
       last_confirmed: lastConfirmedMatch?.[1],
+      flagged_for_review: flaggedForReviewMatch?.[1],
     });
   }
 
@@ -278,6 +281,10 @@ function serializeSection(section: KnowledgeSection): string {
 
   if (section.last_confirmed) {
     markdown += `**Last confirmed**: ${section.last_confirmed}\n`;
+  }
+
+  if (section.flagged_for_review) {
+    markdown += `**Flagged for review**: ${section.flagged_for_review}\n`;
   }
 
   markdown += '\n---\n\n';
@@ -443,7 +450,7 @@ export async function updateSection(
   config: KnowledgeStoreConfig,
   category: KnowledgeCategory,
   sectionId: string,
-  updates: Partial<Pick<KnowledgeSection, 'title' | 'content' | 'confidence' | 'related_files' | 'tags' | 'examples'>>
+  updates: Partial<Pick<KnowledgeSection, 'title' | 'content' | 'confidence' | 'related_files' | 'tags' | 'examples' | 'flagged_for_review'>>
 ): Promise<Result<void, StorageError>> {
   const readResult = await readKnowledgeFile(config, category);
   if (!readResult.ok) {
@@ -779,14 +786,11 @@ export async function recordKnowledgeReference(
     return readResult;
   }
 
-  const index = readResult.value.sections.findIndex(s => s.id === sectionId);
-  if (index === -1) {
-    // Section not found - not an error for fire-and-forget
-    return Ok(undefined);
-  }
-
-  const existing = readResult.value.sections[index];
+  const sections = readResult.value.sections;
+  const index = sections.findIndex(s => s.id === sectionId);
+  const existing = sections[index];
   if (!existing) {
+    // Section not found - not an error for fire-and-forget
     return Ok(undefined);
   }
 
@@ -910,10 +914,9 @@ export async function applyConfidenceDecay(
   let newConfidence: ConfidenceLevel | undefined;
   let action: DecayResult['action'] = 'skipped';
 
-  if (section.confidence === 'established' && eligibleForDecay) {
-    newConfidence = 'tentative';
-    action = 'decayed';
-  } else if (section.confidence === 'developing' && eligibleForDecay) {
+  const canDecay = section.confidence === 'established' || section.confidence === 'developing';
+
+  if (canDecay && eligibleForDecay) {
     newConfidence = 'tentative';
     action = 'decayed';
   } else if (section.confidence === 'tentative' && eligibleForReview) {
@@ -929,6 +932,17 @@ export async function applyConfidenceDecay(
 
     if (!updateResult.ok) {
       return updateResult;
+    }
+  }
+
+  // Persist flagged_for_review timestamp if flagged
+  if (action === 'flagged_for_review' && !section.flagged_for_review) {
+    const flagResult = await updateSection(config, category, section.id, {
+      flagged_for_review: new Date().toISOString(),
+    });
+
+    if (!flagResult.ok) {
+      return flagResult;
     }
   }
 

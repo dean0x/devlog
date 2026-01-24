@@ -233,7 +233,7 @@ describe('knowledge-staleness', () => {
     });
 
     it('decays developing to tentative after threshold', async () => {
-      const sectionId = await createSectionWithAge('Developing Pattern', 'developing', 40);
+      await createSectionWithAge('Developing Pattern', 'developing', 40);
 
       const staleResult = await findStaleKnowledge(config);
       expect(staleResult.ok).toBe(true);
@@ -253,7 +253,7 @@ describe('knowledge-staleness', () => {
     });
 
     it('flags tentative sections for review after 90 days', async () => {
-      await createSectionWithAge('Tentative Pattern', 'tentative', 95);
+      const sectionId = await createSectionWithAge('Tentative Pattern', 'tentative', 95);
 
       const staleResult = await findStaleKnowledge(config);
       expect(staleResult.ok).toBe(true);
@@ -269,6 +269,59 @@ describe('knowledge-staleness', () => {
         expect(decayResult.value.action).toBe('flagged_for_review');
         // Should not decay further - tentative stays tentative
         expect(decayResult.value.newConfidence).toBeUndefined();
+      }
+
+      // Verify flagged_for_review timestamp is persisted
+      const readResult = await readKnowledgeFile(config, 'conventions');
+      expect(readResult.ok).toBe(true);
+      if (readResult.ok) {
+        const updatedSection = readResult.value.sections.find(s => s.id === sectionId);
+        expect(updatedSection?.flagged_for_review).toBeDefined();
+        // Verify it's a valid ISO timestamp
+        const flagDate = new Date(updatedSection?.flagged_for_review ?? '');
+        expect(flagDate.getTime()).not.toBeNaN();
+      }
+    });
+
+    it('does not overwrite existing flagged_for_review timestamp', async () => {
+      // Create a section that was already flagged in the past
+      const pastDate = new Date();
+      pastDate.setDate(pastDate.getDate() - 100);
+      const pastFlagDate = new Date();
+      pastFlagDate.setDate(pastFlagDate.getDate() - 5);
+      const pastIso = pastDate.toISOString();
+      const pastFlagIso = pastFlagDate.toISOString();
+
+      const section: KnowledgeSection = {
+        id: 'already-flagged',
+        title: 'Already Flagged',
+        content: 'Content',
+        confidence: 'tentative',
+        first_observed: pastIso.split('T')[0] ?? pastIso,
+        last_updated: pastIso,
+        last_confirmed: pastIso,
+        observations: 5,
+        flagged_for_review: pastFlagIso, // Already flagged 5 days ago
+      };
+
+      await writeKnowledgeFile(config, 'conventions', [section]);
+
+      const staleResult = await findStaleKnowledge(config);
+      expect(staleResult.ok).toBe(true);
+      if (!staleResult.ok) return;
+
+      const staleSection = staleResult.value[0];
+      if (!staleSection) return;
+
+      const decayResult = await applyConfidenceDecay(config, staleSection);
+      expect(decayResult.ok).toBe(true);
+
+      // Verify the original flag timestamp is preserved
+      const readResult = await readKnowledgeFile(config, 'conventions');
+      expect(readResult.ok).toBe(true);
+      if (readResult.ok) {
+        const updatedSection = readResult.value.sections.find(s => s.id === 'already-flagged');
+        expect(updatedSection?.flagged_for_review).toBe(pastFlagIso);
       }
     });
 

@@ -168,14 +168,19 @@ interface DaemonState {
   startedAt: Date;
   sessionsProcessed: number;
   lastConsolidation: Date | null;
+  lastStalenessCheck: Date | null;
   projects: Map<string, ProjectStats>;
 }
+
+// Rate limit staleness checks to once per hour (staleness changes daily, not per-second)
+const STALENESS_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 let state: DaemonState = {
   running: false,
   startedAt: new Date(),
   sessionsProcessed: 0,
   lastConsolidation: null,
+  lastStalenessCheck: null,
   projects: new Map(),
 };
 
@@ -493,8 +498,19 @@ async function applyConsolidationDecision(
  *   - established + 30 days -> tentative
  *   - developing + 30 days -> tentative
  *   - tentative + 90 days -> flagged for review
+ *
+ * Rate limiting: Only runs once per hour since staleness changes daily
  */
 async function checkForStaleKnowledge(): Promise<void> {
+  // Rate limit: only check once per hour (staleness changes daily, not every 5s)
+  if (state.lastStalenessCheck) {
+    const elapsed = Date.now() - state.lastStalenessCheck.getTime();
+    if (elapsed < STALENESS_CHECK_INTERVAL_MS) {
+      return;
+    }
+  }
+  state.lastStalenessCheck = new Date();
+
   for (const projectPath of state.projects.keys()) {
     const memoryDir = getProjectMemoryDir(projectPath);
     const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir };
@@ -787,6 +803,7 @@ async function startup(config: SimpleDaemonConfig): Promise<void> {
     startedAt: new Date(),
     sessionsProcessed: 0,
     lastConsolidation: null,
+    lastStalenessCheck: null,
     projects: loadedProjects,
   };
 
