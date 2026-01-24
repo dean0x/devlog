@@ -109,6 +109,8 @@ import {
   createSection,
   updateIndex,
   readKnowledgeFile,
+  findStaleKnowledge,
+  applyConfidenceDecay,
   type KnowledgeStoreConfig,
   type KnowledgeCategory,
 } from '../storage/knowledge-store.js';
@@ -166,14 +168,19 @@ interface DaemonState {
   startedAt: Date;
   sessionsProcessed: number;
   lastConsolidation: Date | null;
+  lastStalenessCheck: Date | null;
   projects: Map<string, ProjectStats>;
 }
+
+// Rate limit staleness checks to once per hour (staleness changes daily, not per-second)
+const STALENESS_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 let state: DaemonState = {
   running: false,
   startedAt: new Date(),
   sessionsProcessed: 0,
   lastConsolidation: null,
+  lastStalenessCheck: null,
   projects: new Map(),
 };
 
@@ -477,6 +484,103 @@ async function applyConsolidationDecision(
 }
 
 // ============================================================================
+// Knowledge Staleness Checking
+// ============================================================================
+
+/**
+ * Check for stale knowledge and apply confidence decay
+ *
+ * ARCHITECTURE: Periodic decay check following existing daemon job patterns
+ * Pattern: Iterates all projects, finds stale knowledge, applies decay
+ *
+ * Decay rules:
+ *   - canonical -> NEVER decays (hardcoded invariant)
+ *   - established + 30 days -> tentative
+ *   - developing + 30 days -> tentative
+ *   - tentative + 90 days -> flagged for review
+ *
+ * Rate limiting: Only runs once per hour since staleness changes daily
+ */
+async function checkForStaleKnowledge(): Promise<void> {
+  // Rate limit: only check once per hour (staleness changes daily, not every 5s)
+  if (state.lastStalenessCheck) {
+    const elapsed = Date.now() - state.lastStalenessCheck.getTime();
+    if (elapsed < STALENESS_CHECK_INTERVAL_MS) {
+      return;
+    }
+  }
+  state.lastStalenessCheck = new Date();
+
+  for (const projectPath of state.projects.keys()) {
+    const memoryDir = getProjectMemoryDir(projectPath);
+    const knowledgeStoreConfig: KnowledgeStoreConfig = { memoryDir };
+
+    // Find stale knowledge sections
+    const staleResult = await findStaleKnowledge(knowledgeStoreConfig);
+    if (!staleResult.ok) {
+      logger.warn('Failed to check stale knowledge', {
+        project: projectPath,
+        error: staleResult.error.message,
+      });
+      continue;
+    }
+
+    if (staleResult.value.length === 0) {
+      continue; // No stale knowledge in this project
+    }
+
+    logger.debug('Found stale knowledge', {
+      project: projectPath,
+      count: staleResult.value.length,
+    });
+
+    // Apply decay to each stale section
+    for (const staleSection of staleResult.value) {
+      const decayResult = await applyConfidenceDecay(knowledgeStoreConfig, staleSection);
+
+      if (!decayResult.ok) {
+        logger.warn('Failed to apply confidence decay', {
+          project: projectPath,
+          section: staleSection.section.id,
+          error: decayResult.error.message,
+        });
+        continue;
+      }
+
+      const result = decayResult.value;
+
+      // Log decay events
+      if (result.action === 'decayed') {
+        logger.info('Decayed knowledge confidence', {
+          project: projectPath,
+          section_id: result.sectionId,
+          category: result.category,
+          from: result.previousConfidence,
+          to: result.newConfidence,
+          days_stale: result.daysSinceConfirmed,
+        });
+      } else if (result.action === 'flagged_for_review') {
+        logger.info('Flagged knowledge for review', {
+          project: projectPath,
+          section_id: result.sectionId,
+          category: result.category,
+          confidence: staleSection.section.confidence,
+          days_stale: result.daysSinceConfirmed,
+        });
+      }
+    }
+
+    // Update index if we made any changes
+    const hadChanges = staleResult.value.some(
+      s => s.eligibleForDecay && s.section.confidence !== 'tentative'
+    );
+    if (hadChanges) {
+      await updateIndex(knowledgeStoreConfig);
+    }
+  }
+}
+
+// ============================================================================
 // Catch-Up Summary Pre-Computation
 // ============================================================================
 
@@ -647,6 +751,9 @@ async function processLoop(config: SimpleDaemonConfig): Promise<void> {
       // Check for stale sessions across all known projects
       await checkForStaleSessions(extractorConfig);
 
+      // Check for stale knowledge and apply confidence decay
+      await checkForStaleKnowledge();
+
       // Update pre-computed catch-up summaries (background task)
       await updateCatchUpSummariesIfNeeded(extractorConfig);
     } catch (error) {
@@ -696,6 +803,7 @@ async function startup(config: SimpleDaemonConfig): Promise<void> {
     startedAt: new Date(),
     sessionsProcessed: 0,
     lastConsolidation: null,
+    lastStalenessCheck: null,
     projects: loadedProjects,
   };
 
